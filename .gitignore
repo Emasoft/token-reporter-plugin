@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Dev folders (not published)
+docs_dev/
+scripts_dev/
+samples_dev/
+examples_dev/
+tests_dev/
+downloads_dev/
+libs_dev/
+builds_dev/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.*

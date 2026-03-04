@@ -1,0 +1,5 @@
+{
+  "name": "token-reporter",
+  "description": "Reports per-agent token usage, identity, cost estimates, and activity tracking as a markdown table when agents/subagents complete.",
+  "version": "1.0.0"
+}
