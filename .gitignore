@@ -11,12 +11,12 @@ downloads_dev/
 libs_dev/
 builds_dev/
 
+# Node
+node_modules/
+
 # Python
 __pycache__/
 *.pyc
-
-# Node
-node_modules/
 
 # Logs
 *.log

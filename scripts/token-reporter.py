@@ -255,7 +255,7 @@ def _detect_skill(user_ctx: str, prompt: str) -> str:
 # Agent transcript parsing
 # ─────────────────────────────────────────────
 
-def parse_agent_transcript(path: str, session_id: str) -> dict:
+def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = False) -> dict:
     r = {
         "input_tokens": 0, "output_tokens": 0,
         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
@@ -271,7 +271,21 @@ def parse_agent_transcript(path: str, session_id: str) -> dict:
     }
     seen = set()
 
-    for entry in parse_jsonl(path):
+    # Load all entries so we can optionally filter to last operation
+    all_entries = list(parse_jsonl(path))
+
+    # When last_op_only is True, find the last user entry and only process
+    # assistant entries after it — gives "tokens since last user prompt"
+    start_index = 0
+    if last_op_only:
+        last_user_idx = -1
+        for idx, entry in enumerate(all_entries):
+            if entry.get("type") == "user":
+                last_user_idx = idx
+        if last_user_idx >= 0:
+            start_index = last_user_idx + 1
+
+    for entry in all_entries[start_index:]:
         if entry.get("type") != "assistant" or "message" not in entry:
             continue
         if session_id:
@@ -364,7 +378,6 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     cw = usage["cache_creation_input_tokens"]
     cr = usage["cache_read_input_tokens"]
     msgs = usage["message_count"]
-    total_tok = inp + out + cw + cr
 
     # Tools
     tools = usage.get("tools_used", {})
@@ -382,13 +395,17 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # Header
     rows.append(f"{label} {short_id} · {model_names} · {msgs} messages")
 
-    # The two numbers that matter most
-    rows.append(("💰 Cost",      f"${total_cost:.2f}"))
-    rows.append(("📊 Tokens",    f"{fmt_tok(total_tok)} total"))
+    # Primary tokens (yellow) — fresh input + cache-write = actual new work
+    primary_input = inp + cw
+    tok_val = f"\033[33m{fmt_tok(primary_input)} in · {fmt_tok(out)} out\033[0m"
+    rows.append(("📊 Tokens", tok_val))
 
-    # Breakdown
-    rows.append(("", f"  ↳ {fmt_tok(inp)} input · {fmt_tok(out)} output"))
-    rows.append(("", f"  ↳ {fmt_tok(cw)} cache-write · {fmt_tok(cr)} cache-read"))
+    # Cache read (dim, only if nonzero)
+    if cr > 0:
+        rows.append(("", f"\033[2m  ↳ cache-read: {fmt_tok(cr)}\033[0m"))
+
+    # Cost
+    rows.append(("💰 Cost", f"${total_cost:.2f} (this op)"))
 
     # Per-model breakdown (only if multiple real models)
     if len(real_models) > 1:
@@ -451,9 +468,13 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             return 2
         return 1
 
+    def _strip_ansi(s: str) -> str:
+        """Remove ANSI escape sequences before measuring display width."""
+        return re.sub(r'\033\[[0-9;]*m', '', s)
+
     def dw(s: str) -> int:
         """Display width of a string in terminal columns."""
-        return sum(_char_width(c) for c in s)
+        return sum(_char_width(c) for c in _strip_ansi(s))
 
     def pad(s: str, width: int) -> str:
         """Left-align string s to exactly `width` terminal columns."""
@@ -526,7 +547,9 @@ def main():
     if agent_transcript_path and Path(agent_transcript_path).exists():
         usage = parse_agent_transcript(agent_transcript_path, session_id="")
     elif transcript_path:
-        usage = parse_agent_transcript(transcript_path, session_id=session_id)
+        # For Stop events, only count tokens since last user prompt (this operation)
+        is_stop = hook_event == "Stop"
+        usage = parse_agent_transcript(transcript_path, session_id=session_id, last_op_only=is_stop)
     else:
         sys.exit(0)
 
