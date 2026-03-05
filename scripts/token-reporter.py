@@ -422,31 +422,30 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     rows = []
 
     # ANSI color palette for dark terminals
-    # Principle: bright = changing values, dim = labels/constant text
+    # Principle: ONE color for all static/non-changing text (same as border),
+    # bright colors ONLY for dynamic/changing values that pop out
+    S = "\033[90m"          # static - dark gray (same as border, for ALL non-changing text)
     Y = "\033[93m"          # bright yellow - token values
     C = "\033[96m"          # bright cyan - cost values
     M = "\033[95m"          # bright magenta - per-tool token values
     G = "\033[92m"          # bright green - tool counts
-    W = "\033[97m"          # bright white - dynamic header info, tool names
-    L = "\033[37m"          # light gray - static labels (input, output, etc.)
-    D = "\033[90m"          # dark gray - dim labels (cache line prefix)
-    DV = "\033[37m"         # light gray - cache values (brighter than prefix)
+    W = "\033[97m"          # bright white - session id, model, msg count, tool names
     R = "\033[0m"           # reset
 
-    # Header: label text dim, dynamic values bright
-    rows.append(f"{D}{label}{R} {W}{short_id}{R} {D}|{R} {W}{model_names}{R} {D}|{R} {W}{msgs}{R} {D}messages{R}")
+    # Header: static text same as border, dynamic values bright
+    rows.append(f"{S}{label}{R} {W}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}")
 
-    # Primary tokens (bright yellow values, dim labels)
+    # Primary tokens (bright yellow values, static labels)
     primary_input = inp + cw
-    tok_val = f"{Y}{fmt_tok(primary_input)}{R} {L}input{R} / {Y}{fmt_tok(out)}{R} {L}output{R}"
+    tok_val = f"{Y}{fmt_tok(primary_input)}{R} {S}input{R} {S}/{R} {Y}{fmt_tok(out)}{R} {S}output{R}"
     rows.append(("Tokens", tok_val))
 
-    # Cache read (dark gray prefix, light gray value, only if nonzero)
+    # Cache read (all static except the value)
     if cr > 0:
-        rows.append(("", f"{D}  L cache-read:{R} {DV}{fmt_tok(cr)}{R}"))
+        rows.append(("", f"{S}  L cache-read:{R} {Y}{fmt_tok(cr)}{R}"))
 
-    # Cost (bright cyan value, dim label)
-    rows.append(("Cost", f"{C}${total_cost:.2f}{R} {L}(this op){R}"))
+    # Cost (bright cyan value, static label)
+    rows.append(("Cost", f"{C}${total_cost:.2f}{R} {S}(this op){R}"))
 
     # Per-model breakdown (only if multiple real models)
     if len(real_models) > 1:
@@ -454,39 +453,39 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             c = estimate_cost(stats, model)
             mt = sum(stats[f] for f in ["input_tokens", "output_tokens",
                      "cache_creation_input_tokens", "cache_read_input_tokens"])
-            rows.append((f"  L {shorten_model(model)}", f"{Y}{fmt_tok(mt)}{R} {L}tokens{R} / {C}${c:.2f}{R}"))
+            rows.append((f"{S}  L {shorten_model(model)}{R}", f"{Y}{fmt_tok(mt)}{R} {S}tokens /{R} {C}${c:.2f}{R}"))
 
     # Tools with per-tool token attribution
     tools_tokens = usage.get("tools_tokens", {})
     if top_tools:
-        tool_str = "  ".join(f"{W}{t}{R} {G}x{c}{R}" for t, c in top_tools)
+        tool_str = f" {S}/{R} ".join(f"{W}{t}{R} {G}x{c}{R}" for t, c in top_tools)
         rows.append(("Tools", tool_str))
         # Per-tool token breakdown
         for t, c in top_tools:
             tt = tools_tokens.get(t, {})
             t_out = tt.get("output", 0)
             if t_out > 0:
-                rows.append(("", f"  L {W}{t}{R} {G}x{c}{R}{L}:{R} {M}{fmt_tok(t_out)}{R} {L}output{R}"))
+                rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{S}:{R} {M}{fmt_tok(t_out)}{R} {S}output{R}"))
 
-    # Files summary (counts bright, labels dim)
+    # Files summary (counts bright, labels static)
     file_parts = []
-    if fr: file_parts.append(f"{W}{len(fr)}{R} {L}read{R}")
-    if fe: file_parts.append(f"{W}{len(fe)}{R} {L}edited{R}")
-    if fw: file_parts.append(f"{W}{len(fw)}{R} {L}written{R}")
+    if fr: file_parts.append(f"{W}{len(fr)}{R} {S}read{R}")
+    if fe: file_parts.append(f"{W}{len(fe)}{R} {S}edited{R}")
+    if fw: file_parts.append(f"{W}{len(fw)}{R} {S}written{R}")
     if file_parts:
-        rows.append(("Files", f" {L}/{R} ".join(file_parts)))
+        rows.append(("Files", f" {S}/{R} ".join(file_parts)))
 
     # List edited files
     for f in fe[:5]:
-        rows.append(("", f"  {D}*{R} {L}{f}{R}"))
+        rows.append(("", f"  {S}*{R} {W}{f}{R}"))
     if len(fe) > 5:
-        rows.append(("", f"  {D}+{len(fe) - 5} more{R}"))
+        rows.append(("", f"  {S}+{len(fe) - 5} more{R}"))
 
     # List written files
     for f in fw[:3]:
-        rows.append(("", f"  {D}+{R} {L}{f}{R}"))
+        rows.append(("", f"  {S}+{R} {W}{f}{R}"))
     if len(fw) > 3:
-        rows.append(("", f"  {D}+{len(fw) - 3} more{R}"))
+        rows.append(("", f"  {S}+{len(fw) - 3} more{R}"))
 
     # Subagent task
     if is_sub:
@@ -546,24 +545,28 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     inner_w = max_label + 3 + max_val  # 3 = " │ " separator
     inner_w = max(inner_w, dw(header))
 
+    # Use S (dark gray) for all border and label chrome
+    S = "\033[90m"
+    R = "\033[0m"
+
     lines = []
     lines.append("")  # newline to avoid box top being broken by preceding text
-    lines.append(f"╭{'─' * (inner_w + 2)}╮")
-    lines.append(f"│ {pad(header, inner_w)} │")
-    lines.append(f"├{'─' * (inner_w + 2)}┤")
+    lines.append(f"{S}╭{'─' * (inner_w + 2)}╮{R}")
+    lines.append(f"{S}│{R} {pad(header, inner_w)} {S}│{R}")
+    lines.append(f"{S}├{'─' * (inner_w + 2)}┤{R}")
 
     for row in data_rows:
         if isinstance(row, tuple):
             lbl, val = row
             if lbl:
-                line = f"{pad(lbl, max_label)} │ {val}"
+                line = f"{S}{pad(lbl, max_label)}{R} {S}│{R} {val}"
             else:
                 line = f"{pad('', max_label)}   {val}"
-            lines.append(f"│ {pad(line, inner_w)} │")
+            lines.append(f"{S}│{R} {pad(line, inner_w)} {S}│{R}")
         else:
-            lines.append(f"│ {pad(str(row), inner_w)} │")
+            lines.append(f"{S}│{R} {pad(str(row), inner_w)} {S}│{R}")
 
-    lines.append(f"╰{'─' * (inner_w + 2)}╯")
+    lines.append(f"{S}╰{'─' * (inner_w + 2)}╯{R}")
 
     return "\n".join(lines)
 
