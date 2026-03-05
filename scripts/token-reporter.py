@@ -421,28 +421,32 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # ── Build rows ──
     rows = []
 
-    # Header
-    rows.append(f"{label} {short_id} | {model_names} | {msgs} messages")
+    # ANSI color palette for dark terminals
+    # Principle: bright = changing values, dim = labels/constant text
+    Y = "\033[93m"          # bright yellow - token values
+    C = "\033[96m"          # bright cyan - cost values
+    M = "\033[95m"          # bright magenta - per-tool token values
+    G = "\033[92m"          # bright green - tool counts
+    W = "\033[97m"          # bright white - dynamic header info, tool names
+    L = "\033[37m"          # light gray - static labels (input, output, etc.)
+    D = "\033[90m"          # dark gray - dim labels (cache line prefix)
+    DV = "\033[37m"         # light gray - cache values (brighter than prefix)
+    R = "\033[0m"           # reset
 
-    # ANSI bright colors for dark terminals
-    Y = "\033[93m"   # bright yellow - tokens
-    C = "\033[96m"   # bright cyan - cost
-    M = "\033[95m"   # bright magenta - tool output tokens
-    G = "\033[92m"   # bright green - tool counts
-    D = "\033[2m"    # dim - cache info
-    R = "\033[0m"    # reset
+    # Header: label text dim, dynamic values bright
+    rows.append(f"{D}{label}{R} {W}{short_id}{R} {D}|{R} {W}{model_names}{R} {D}|{R} {W}{msgs}{R} {D}messages{R}")
 
-    # Primary tokens (bright yellow)
+    # Primary tokens (bright yellow values, dim labels)
     primary_input = inp + cw
-    tok_val = f"{Y}{fmt_tok(primary_input)}{R} input / {Y}{fmt_tok(out)}{R} output"
+    tok_val = f"{Y}{fmt_tok(primary_input)}{R} {L}input{R} / {Y}{fmt_tok(out)}{R} {L}output{R}"
     rows.append(("Tokens", tok_val))
 
-    # Cache read (dim, only if nonzero)
+    # Cache read (dark gray prefix, light gray value, only if nonzero)
     if cr > 0:
-        rows.append(("", f"{D}  > cache-read: {fmt_tok(cr)}{R}"))
+        rows.append(("", f"{D}  L cache-read:{R} {DV}{fmt_tok(cr)}{R}"))
 
-    # Cost (bright cyan)
-    rows.append(("Cost", f"{C}${total_cost:.2f}{R} (this op)"))
+    # Cost (bright cyan value, dim label)
+    rows.append(("Cost", f"{C}${total_cost:.2f}{R} {L}(this op){R}"))
 
     # Per-model breakdown (only if multiple real models)
     if len(real_models) > 1:
@@ -450,39 +454,39 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             c = estimate_cost(stats, model)
             mt = sum(stats[f] for f in ["input_tokens", "output_tokens",
                      "cache_creation_input_tokens", "cache_read_input_tokens"])
-            rows.append((f"  > {shorten_model(model)}", f"{Y}{fmt_tok(mt)}{R} tokens / {C}${c:.2f}{R}"))
+            rows.append((f"  L {shorten_model(model)}", f"{Y}{fmt_tok(mt)}{R} {L}tokens{R} / {C}${c:.2f}{R}"))
 
     # Tools with per-tool token attribution
     tools_tokens = usage.get("tools_tokens", {})
     if top_tools:
-        tool_str = "  ".join(f"{t} {G}x{c}{R}" for t, c in top_tools)
+        tool_str = "  ".join(f"{W}{t}{R} {G}x{c}{R}" for t, c in top_tools)
         rows.append(("Tools", tool_str))
-        # Per-tool token breakdown (show output tokens consumed by each tool)
+        # Per-tool token breakdown
         for t, c in top_tools:
             tt = tools_tokens.get(t, {})
             t_out = tt.get("output", 0)
             if t_out > 0:
-                rows.append(("", f"  > {t} {G}x{c}{R}: {M}{fmt_tok(t_out)}{R} output"))
+                rows.append(("", f"  L {W}{t}{R} {G}x{c}{R}{L}:{R} {M}{fmt_tok(t_out)}{R} {L}output{R}"))
 
-    # Files summary
+    # Files summary (counts bright, labels dim)
     file_parts = []
-    if fr: file_parts.append(f"{len(fr)} read")
-    if fe: file_parts.append(f"{len(fe)} edited")
-    if fw: file_parts.append(f"{len(fw)} written")
+    if fr: file_parts.append(f"{W}{len(fr)}{R} {L}read{R}")
+    if fe: file_parts.append(f"{W}{len(fe)}{R} {L}edited{R}")
+    if fw: file_parts.append(f"{W}{len(fw)}{R} {L}written{R}")
     if file_parts:
-        rows.append(("Files", " / ".join(file_parts)))
+        rows.append(("Files", f" {L}/{R} ".join(file_parts)))
 
-    # List edited files (most interesting)
+    # List edited files
     for f in fe[:5]:
-        rows.append(("", f"  * {f}"))
+        rows.append(("", f"  {D}*{R} {L}{f}{R}"))
     if len(fe) > 5:
-        rows.append(("", f"  +{len(fe) - 5} more"))
+        rows.append(("", f"  {D}+{len(fe) - 5} more{R}"))
 
     # List written files
     for f in fw[:3]:
-        rows.append(("", f"  + {f}"))
+        rows.append(("", f"  {D}+{R} {L}{f}{R}"))
     if len(fw) > 3:
-        rows.append(("", f"  +{len(fw) - 3} more"))
+        rows.append(("", f"  {D}+{len(fw) - 3} more{R}"))
 
     # Subagent task
     if is_sub:
