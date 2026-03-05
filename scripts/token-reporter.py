@@ -427,12 +427,13 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     S = "\033[94m"          # static - bright blue (border, labels, all non-changing text)
     Y = "\033[93m"          # bright yellow - ALL token values (unified)
     C = "\033[92m"          # bright green - cost values
-    G = "\033[96m"          # bright cyan - tool counts, session hash
+    G = "\033[95m"          # bright magenta - tool counts
+    H = "\033[96m"          # bright cyan - session hash
     W = "\033[97m"          # bright white - model, msg count, tool names
     R = "\033[0m"           # reset
 
     # Header: static text same as border, dynamic values bright
-    rows.append(f"{S}{label}{R} {G}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}")
+    rows.append(f"{S}{label}{R} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}")
 
     # Primary tokens (bright yellow values, static labels)
     primary_input = inp + cw
