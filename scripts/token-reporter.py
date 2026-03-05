@@ -424,17 +424,25 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # Header
     rows.append(f"{label} {short_id} | {model_names} | {msgs} messages")
 
-    # Primary tokens (yellow) — fresh input + cache-write = actual new work
+    # ANSI bright colors for dark terminals
+    Y = "\033[93m"   # bright yellow - tokens
+    C = "\033[96m"   # bright cyan - cost
+    M = "\033[95m"   # bright magenta - tool output tokens
+    G = "\033[92m"   # bright green - tool counts
+    D = "\033[2m"    # dim - cache info
+    R = "\033[0m"    # reset
+
+    # Primary tokens (bright yellow)
     primary_input = inp + cw
-    tok_val = f"\033[33m{fmt_tok(primary_input)} input / {fmt_tok(out)} output\033[0m"
+    tok_val = f"{Y}{fmt_tok(primary_input)}{R} input / {Y}{fmt_tok(out)}{R} output"
     rows.append(("Tokens", tok_val))
 
     # Cache read (dim, only if nonzero)
     if cr > 0:
-        rows.append(("", f"\033[2m  > cache-read: {fmt_tok(cr)}\033[0m"))
+        rows.append(("", f"{D}  > cache-read: {fmt_tok(cr)}{R}"))
 
-    # Cost
-    rows.append(("Cost", f"${total_cost:.2f} (this op)"))
+    # Cost (bright cyan)
+    rows.append(("Cost", f"{C}${total_cost:.2f}{R} (this op)"))
 
     # Per-model breakdown (only if multiple real models)
     if len(real_models) > 1:
@@ -442,19 +450,19 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             c = estimate_cost(stats, model)
             mt = sum(stats[f] for f in ["input_tokens", "output_tokens",
                      "cache_creation_input_tokens", "cache_read_input_tokens"])
-            rows.append((f"  > {shorten_model(model)}", f"{fmt_tok(mt)} tokens / ${c:.2f}"))
+            rows.append((f"  > {shorten_model(model)}", f"{Y}{fmt_tok(mt)}{R} tokens / {C}${c:.2f}{R}"))
 
     # Tools with per-tool token attribution
     tools_tokens = usage.get("tools_tokens", {})
     if top_tools:
-        tool_str = "  ".join(f"{t}x{c}" for t, c in top_tools)
+        tool_str = "  ".join(f"{t} {G}x{c}{R}" for t, c in top_tools)
         rows.append(("Tools", tool_str))
         # Per-tool token breakdown (show output tokens consumed by each tool)
         for t, c in top_tools:
             tt = tools_tokens.get(t, {})
             t_out = tt.get("output", 0)
             if t_out > 0:
-                rows.append(("", f"  > {t}x{c}: {fmt_tok(t_out)} output"))
+                rows.append(("", f"  > {t} {G}x{c}{R}: {M}{fmt_tok(t_out)}{R} output"))
 
     # Files summary
     file_parts = []
