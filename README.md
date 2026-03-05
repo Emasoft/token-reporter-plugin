@@ -4,7 +4,7 @@ A Claude Code plugin that displays per-operation token usage when agents and sub
 
 ## What it does
 
-After each Claude Code response (Stop) or subagent completion (SubagentStop), a compact unicode-bordered report is shown in the terminal:
+After each Claude Code response (Stop), subagent completion (SubagentStop), teammate pause (TeammateIdle), or task completion (TaskCompleted), a compact unicode-bordered report is shown in the terminal:
 
 ```
 ╭────────────────────────────────────────────────────────────╮
@@ -34,7 +34,7 @@ After each Claude Code response (Stop) or subagent completion (SubagentStop), a 
 
 - **Per-operation tokens** -- reports only the tokens consumed since the last user prompt (not cumulative session totals)
 - **Actual consumption** -- shows `fresh_input + cache_write` as primary input (the tokens that count against rate limits), with cache-read shown separately
-- **Subagent reports** -- each subagent gets its own report box with agent type/name (e.g., "Subagent Explore"), model used, tools invoked, and files touched
+- **Subagent reports** -- each subagent, teammate, or task gets its own report box with agent type/name (e.g., "Subagent Explore", "Teammate", "Task"), model used, tools invoked, and files touched
 - **Per-tool token attribution** -- how many output tokens each tool consumed
 - **Cost estimates** -- based on published Anthropic API pricing (useful for comparing model efficiency, even on Pro Max plans where billing is flat-rate)
 - **Color-coded terminal output** -- bright yellow for token values, green for cost, magenta for tool counts, cyan for session hash, blue for all static text and borders
@@ -56,7 +56,7 @@ mkdir -p ~/.claude/plugins/marketplaces/local-marketplace/plugins/
 cp -r token-reporter ~/.claude/plugins/marketplaces/local-marketplace/plugins/token-reporter
 ```
 
-Then enable it in Claude Code settings (`enabledPlugins`).
+Then enable it in Claude Code settings (`enabledPlugins`). Use `/reload-plugins` to activate changes without restarting.
 
 ## Plugin structure
 
@@ -65,30 +65,26 @@ token-reporter/
   .claude-plugin/
     plugin.json          # Plugin manifest
   hooks/
-    hooks.json           # Hook configuration (Stop + SubagentStop)
+    hooks.json           # Hook configuration (Stop, SubagentStop, TeammateIdle, TaskCompleted)
   scripts/
     token-reporter.py    # Main hook script
 ```
 
 ## How it works
 
-1. **SubagentStop** hook fires when a subagent completes -- the script parses the subagent's transcript, builds a report, and saves it to a temp file (`/tmp/token-reporter/{session}/`)
-2. **Stop** hook fires when the main session responds -- the script collects any saved subagent reports, parses the main session transcript (only entries since the last user prompt), and displays all reports together via `systemMessage`
+1. **SubagentStop / TeammateIdle / TaskCompleted** hooks fire when a child agent completes or pauses -- the script parses the agent's transcript, builds a report, and saves it to a temp file (`/tmp/token-reporter/{session}/`)
+2. **Stop** hook fires when the main session responds -- the script collects any saved child agent reports, parses the main session transcript (only entries since the last user prompt), and displays all reports together via `systemMessage`
 
-This two-phase approach is needed because Claude Code only renders `systemMessage` to the terminal for Stop events, not SubagentStop events.
+This two-phase approach is needed because Claude Code only renders `systemMessage` to the terminal for Stop events, not child agent events.
 
 ## Configuration
 
-The plugin uses two hooks defined in `hooks/hooks.json`:
+The plugin uses four hooks defined in `hooks/hooks.json`:
 
-```json
-{
-  "hooks": {
-    "SubagentStop": [{"hooks": [{"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"}]}]
-  }
-}
-```
+- **Stop** -- main session response complete
+- **SubagentStop** -- subagent (Explore, Plan, etc.) finished
+- **TeammateIdle** -- teammate agent paused/waiting
+- **TaskCompleted** -- background task finished
 
 ### Debug mode
 
@@ -107,7 +103,7 @@ Enable Claude Code debug mode to see detailed stderr logs from the hook:
 ## Requirements
 
 - Python 3.8+
-- Claude Code 2.1+
+- Claude Code 2.1.69+ (for TeammateIdle/TaskCompleted support)
 
 ## License
 

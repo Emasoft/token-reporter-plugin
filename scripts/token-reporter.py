@@ -390,8 +390,10 @@ def _rel_path(filepath: str, project_dir: str) -> str:
 
 def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict) -> str:
     """Build a compact unicode-bordered report for terminal display."""
-    is_sub = hook_event == "SubagentStop"
-    label = "Subagent" if is_sub else "Session"
+    is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
+    # Show the hook event type as the label for teammate/task events
+    label_map = {"SubagentStop": "Subagent", "TeammateIdle": "Teammate", "TaskCompleted": "Task"}
+    label = label_map.get(hook_event, "Session")
     agent_id = hook_input.get("agent_id", hook_input.get("session_id", ""))
     short_id = agent_id[:8] if agent_id else "?"
     project_dir = hook_input.get("cwd", "")
@@ -603,9 +605,13 @@ def main():
         dbg("exit: no session_id and no agent_transcript_path")
         sys.exit(0)
 
+    # Subagent-type events: SubagentStop, TeammateIdle, TaskCompleted
+    # All report on a child agent's lifecycle, not the main session
+    is_subagent_event = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
+
     # Step 1: Identity from parent transcript
     identity = {}
-    if hook_event == "SubagentStop" and transcript_path:
+    if is_subagent_event and transcript_path:
         identity = extract_agent_identity(transcript_path, agent_id)
     if not identity.get("subagent_type") and agent_type:
         identity["subagent_type"] = agent_type
@@ -647,8 +653,8 @@ def main():
     import tempfile
     report_dir = Path(tempfile.gettempdir()) / "token-reporter" / session_id[:16]
 
-    if hook_event == "SubagentStop":
-        # Save this subagent's report to a temp file for later collection
+    if is_subagent_event:
+        # Save this subagent/teammate/task report to a temp file for later collection
         report_dir.mkdir(parents=True, exist_ok=True)
         aid = agent_id[:8] if agent_id else "unknown"
         report_file = report_dir / f"subagent-{aid}-{int(time.time()*1000)}.txt"
