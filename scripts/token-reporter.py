@@ -40,6 +40,7 @@ Configure in .claude/settings.json (merge with existing hooks):
 import json
 import sys
 import re
+import time
 from pathlib import Path
 from collections import defaultdict, Counter
 
@@ -266,6 +267,7 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
             "message_count": 0,
         }),
         "tools_used": Counter(),
+        "tools_tokens": defaultdict(lambda: {"input": 0, "output": 0}),
         "files_read": set(), "files_written": set(), "files_edited": set(),
         "bash_commands": [], "web_fetches": [],
     }
@@ -312,10 +314,14 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
         content = msg.get("content", [])
         if not isinstance(content, list):
             continue
+
+        # Collect tool names in this message for token attribution
+        msg_tools = []
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
             tn = block.get("name", "unknown")
+            msg_tools.append(tn)
             r["tools_used"][tn] += 1
             ti = block.get("input", {})
             if not isinstance(ti, dict):
@@ -333,6 +339,15 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
                 q = ti.get("url", ti.get("query", ""))
                 if q:
                     r["web_fetches"].append(trunc(q, 80))
+
+        # Attribute this message's tokens to the tools it invoked
+        u = msg.get("usage", {})
+        if msg_tools and u:
+            per_tool_out = u.get("output_tokens", 0) // len(msg_tools)
+            per_tool_inp = u.get("input_tokens", 0) // len(msg_tools)
+            for tn in msg_tools:
+                r["tools_tokens"][tn]["output"] += per_tool_out
+                r["tools_tokens"][tn]["input"] += per_tool_inp
 
     r["files_read"] = sorted(r["files_read"])
     r["files_written"] = sorted(r["files_written"])
@@ -397,7 +412,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
 
     # Primary tokens (yellow) — fresh input + cache-write = actual new work
     primary_input = inp + cw
-    tok_val = f"\033[33m{fmt_tok(primary_input)} in · {fmt_tok(out)} out\033[0m"
+    tok_val = f"\033[33m{fmt_tok(primary_input)} input · {fmt_tok(out)} output\033[0m"
     rows.append(("📊 Tokens", tok_val))
 
     # Cache read (dim, only if nonzero)
@@ -415,10 +430,17 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
                      "cache_creation_input_tokens", "cache_read_input_tokens"])
             rows.append((f"  ↳ {shorten_model(model)}", f"{fmt_tok(mt)} tokens · ${c:.2f}"))
 
-    # Tools
+    # Tools with per-tool token attribution
+    tools_tokens = usage.get("tools_tokens", {})
     if top_tools:
         tool_str = "  ".join(f"{t}×{c}" for t, c in top_tools)
         rows.append(("🔧 Tools", tool_str))
+        # Per-tool token breakdown (show output tokens consumed by each tool)
+        for t, c in top_tools:
+            tt = tools_tokens.get(t, {})
+            t_out = tt.get("output", 0)
+            if t_out > 0:
+                rows.append(("", f"  ↳ {t}×{c}: {fmt_tok(t_out)} output"))
 
     # Files summary
     file_parts = []
@@ -495,6 +517,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     inner_w = max(inner_w, dw(header))
 
     lines = []
+    lines.append("")  # newline to avoid box top being broken by preceding text
     lines.append(f"╭{'─' * (inner_w + 2)}╮")
     lines.append(f"│ {pad(header, inner_w)} │")
     lines.append(f"├{'─' * (inner_w + 2)}┤")
@@ -519,12 +542,20 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
 # Main
 # ─────────────────────────────────────────────
 
+def dbg(msg: str):
+    """Debug log to stderr — visible in ~/.claude/debug/ when debug mode is on."""
+    print(f"[token-reporter] {msg}", file=sys.stderr)
+
+
 def main():
+    dbg("hook invoked")
     try:
         hook_input = json.load(sys.stdin)
     except json.JSONDecodeError as e:
-        print(f"Error parsing hook input: {e}", file=sys.stderr)
+        dbg(f"JSON parse error: {e}")
         sys.exit(1)
+
+    dbg(f"hook_event={hook_input.get('hook_event_name')} session={hook_input.get('session_id','')[:8]}")
 
     session_id = hook_input.get("session_id", "")
     transcript_path = hook_input.get("transcript_path", "")
@@ -534,6 +565,7 @@ def main():
     agent_transcript_path = hook_input.get("agent_transcript_path", "")
 
     if not session_id and not agent_transcript_path:
+        dbg("exit: no session_id and no agent_transcript_path")
         sys.exit(0)
 
     # Step 1: Identity from parent transcript
@@ -544,20 +576,33 @@ def main():
         identity["subagent_type"] = agent_type
 
     # Step 2: Token usage from agent's own transcript
+    # For Stop events, wait briefly for the transcript to be flushed to disk —
+    # the hook fires before the current response is written to the JSONL file
+    if hook_event == "Stop":
+        dbg("waiting 3s for transcript flush...")
+        time.sleep(3)
+
     if agent_transcript_path and Path(agent_transcript_path).exists():
+        dbg(f"parsing agent transcript: {agent_transcript_path}")
         usage = parse_agent_transcript(agent_transcript_path, session_id="")
     elif transcript_path:
         # For Stop events, only count tokens since last user prompt (this operation)
         is_stop = hook_event == "Stop"
+        dbg(f"parsing session transcript: {transcript_path} last_op_only={is_stop}")
         usage = parse_agent_transcript(transcript_path, session_id=session_id, last_op_only=is_stop)
     else:
+        dbg("exit: no transcript path found")
         sys.exit(0)
 
+    dbg(f"messages={usage['message_count']} inp={usage['input_tokens']} out={usage['output_tokens']} cw={usage['cache_creation_input_tokens']} cr={usage['cache_read_input_tokens']}")
+
     if usage["message_count"] == 0:
+        dbg("exit: message_count=0")
         sys.exit(0)
 
     # Step 3: Build markdown report
     report = build_report(hook_event, hook_input, usage, identity)
+    dbg(f"report built, length={len(report)}")
 
     # Stop/SubagentStop output format (from official hooks reference):
     #   - hookSpecificOutput is NOT supported for Stop/SubagentStop
