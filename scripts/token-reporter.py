@@ -433,7 +433,10 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     R = "\033[0m"           # reset
 
     # Header: static text same as border, dynamic values bright
-    rows.append(f"{S}{label}{R} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}")
+    # For SubagentStop, show the agent type (e.g. "Subagent Explore a2c30deb")
+    sub_type = identity.get("subagent_type", "") if is_sub else ""
+    type_part = f" {W}{sub_type}{R}" if sub_type else ""
+    rows.append(f"{S}{label}{R}{type_part} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}")
 
     # Primary tokens (bright yellow values, static labels)
     primary_input = inp + cw
@@ -634,21 +637,49 @@ def main():
         dbg("exit: message_count=0")
         sys.exit(0)
 
-    # Step 3: Build markdown report
+    # Step 3: Build report
     report = build_report(hook_event, hook_input, usage, identity)
     dbg(f"report built, length={len(report)}")
 
-    # Stop/SubagentStop output format (from official hooks reference):
-    #   - hookSpecificOutput is NOT supported for Stop/SubagentStop
-    #     (only PreToolUse, PostToolUse, UserPromptSubmit, PermissionRequest,
-    #     SessionStart have hookSpecificOutput)
-    #   - Supported event-specific fields: decision ("block"|undefined), reason
-    #   - Common fields: continue, stopReason, suppressOutput, systemMessage
-    #   - stdout for Stop/SubagentStop shows in verbose mode (ctrl+o)
-    #   - systemMessage is "optional warning message shown to the user"
-    output = {
-        "systemMessage": report,
-    }
+    # SubagentStop systemMessage is not rendered to the terminal by Claude Code,
+    # so we save subagent reports to temp files. The Stop hook then collects
+    # and displays them all together with the main session report.
+    import tempfile
+    report_dir = Path(tempfile.gettempdir()) / "token-reporter" / session_id[:16]
+
+    if hook_event == "SubagentStop":
+        # Save this subagent's report to a temp file for later collection
+        report_dir.mkdir(parents=True, exist_ok=True)
+        aid = agent_id[:8] if agent_id else "unknown"
+        report_file = report_dir / f"subagent-{aid}-{int(time.time()*1000)}.txt"
+        report_file.write_text(report, encoding="utf-8")
+        dbg(f"saved subagent report to {report_file}")
+        # Still return systemMessage (it becomes a system context message for the AI)
+        output = {"systemMessage": report}
+        print(json.dumps(output))
+        sys.exit(0)
+
+    # Stop event: collect any saved subagent reports, prepend them, then show all
+    subagent_reports = []
+    if report_dir.exists():
+        for f in sorted(report_dir.glob("subagent-*.txt")):
+            try:
+                subagent_reports.append(f.read_text(encoding="utf-8"))
+                f.unlink()  # clean up after reading
+            except OSError:
+                pass
+        # Remove the dir if empty
+        try:
+            report_dir.rmdir()
+        except OSError:
+            pass
+    dbg(f"collected {len(subagent_reports)} subagent reports")
+
+    # Combine: subagent reports first, then main session report
+    all_reports = subagent_reports + [report]
+    combined = "\n".join(all_reports)
+
+    output = {"systemMessage": combined}
     print(json.dumps(output))
     sys.exit(0)
 
