@@ -424,11 +424,11 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # ANSI color palette for dark terminals
     # Principle: ONE color for all static/non-changing text (same as border),
     # bright colors ONLY for dynamic/changing values that pop out
-    S = "\033[34m"          # static - blue (same as border, for ALL non-changing text)
+    S = "\033[94m"          # static - bright blue (border, labels, all non-changing text)
     Y = "\033[93m"          # bright yellow - token values
-    C = "\033[96m"          # bright cyan - cost values
+    C = "\033[92m"          # bright green - cost values
     M = "\033[95m"          # bright magenta - per-tool token values
-    G = "\033[92m"          # bright green - tool counts
+    G = "\033[96m"          # bright cyan - tool counts
     W = "\033[97m"          # bright white - session id, model, msg count, tool names
     R = "\033[0m"           # reset
 
@@ -545,9 +545,8 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     inner_w = max_label + 3 + max_val  # 3 = " │ " separator
     inner_w = max(inner_w, dw(header))
 
-    # Use S (dark gray) for all border and label chrome
-    S = "\033[90m"
-    R = "\033[0m"
+    # Use S for all border and label chrome (must match S defined above)
+    # (S and R already defined above in the color palette)
 
     lines = []
     lines.append("")  # newline to avoid box top being broken by preceding text
