@@ -276,13 +276,27 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
     # Load all entries so we can optionally filter to last operation
     all_entries = list(parse_jsonl(path))
 
-    # When last_op_only is True, find the last user entry and only process
-    # assistant entries after it — gives "tokens since last user prompt"
+    # When last_op_only is True, find the last real user prompt and only process
+    # entries after it. We must skip tool_result entries which also have type=user
+    # but are not actual user prompts — they're responses from tool calls.
     start_index = 0
     if last_op_only:
         last_user_idx = -1
         for idx, entry in enumerate(all_entries):
-            if entry.get("type") == "user":
+            if entry.get("type") != "user":
+                continue
+            # tool_result entries have type=user but contain tool_result content blocks
+            msg = entry.get("message", {})
+            content = msg.get("content", [])
+            is_tool_result = False
+            if isinstance(content, list):
+                is_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                )
+            elif isinstance(content, str) and content == "":
+                is_tool_result = False
+            if not is_tool_result:
                 last_user_idx = idx
         if last_user_idx >= 0:
             start_index = last_user_idx + 1
@@ -595,6 +609,8 @@ def main():
         sys.exit(0)
 
     dbg(f"messages={usage['message_count']} inp={usage['input_tokens']} out={usage['output_tokens']} cw={usage['cache_creation_input_tokens']} cr={usage['cache_read_input_tokens']}")
+    dbg(f"tools={dict(usage.get('tools_used', {}))}")
+    dbg(f"tools_tokens={dict(usage.get('tools_tokens', {}))}")
 
     if usage["message_count"] == 0:
         dbg("exit: message_count=0")
