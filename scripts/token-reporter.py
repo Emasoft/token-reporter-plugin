@@ -425,15 +425,14 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # Principle: ONE color for all static/non-changing text (same as border),
     # bright colors ONLY for dynamic/changing values that pop out
     S = "\033[94m"          # static - bright blue (border, labels, all non-changing text)
-    Y = "\033[93m"          # bright yellow - token values
+    Y = "\033[93m"          # bright yellow - ALL token values (unified)
     C = "\033[92m"          # bright green - cost values
-    M = "\033[95m"          # bright magenta - per-tool token values
-    G = "\033[96m"          # bright cyan - tool counts
-    W = "\033[97m"          # bright white - session id, model, msg count, tool names
+    G = "\033[96m"          # bright cyan - tool counts, session hash
+    W = "\033[97m"          # bright white - model, msg count, tool names
     R = "\033[0m"           # reset
 
     # Header: static text same as border, dynamic values bright
-    rows.append(f"{S}{label}{R} {W}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}")
+    rows.append(f"{S}{label}{R} {G}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}")
 
     # Primary tokens (bright yellow values, static labels)
     primary_input = inp + cw
@@ -465,7 +464,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             tt = tools_tokens.get(t, {})
             t_out = tt.get("output", 0)
             if t_out > 0:
-                rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{S}:{R} {M}{fmt_tok(t_out)}{R} {S}output{R}"))
+                rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{S}:{R} {Y}{fmt_tok(t_out)}{R} {S}output{R}"))
 
     # Files summary (counts bright, labels static)
     file_parts = []
