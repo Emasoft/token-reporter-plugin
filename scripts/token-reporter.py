@@ -491,7 +491,11 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
 
     def _char_width(c: str) -> int:
         """Terminal display width of a single character."""
-        # Variation selectors, zero-width joiners, combining marks = 0 width
+        cp = ord(c)
+        # Box drawing (U+2500-U+257F) and block elements (U+2580-U+259F)
+        # are always 1 column wide despite being category So
+        if 0x2500 <= cp <= 0x259F:
+            return 1
         cat = unicodedata.category(c)
         if cat.startswith('M') or cat == 'Cf':  # Mark or Format
             return 0
