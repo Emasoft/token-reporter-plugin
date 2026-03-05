@@ -422,16 +422,16 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     rows = []
 
     # Header
-    rows.append(f"{label} {short_id} · {model_names} · {msgs} messages")
+    rows.append(f"{label} {short_id} | {model_names} | {msgs} messages")
 
     # Primary tokens (yellow) — fresh input + cache-write = actual new work
     primary_input = inp + cw
-    tok_val = f"\033[33m{fmt_tok(primary_input)} input · {fmt_tok(out)} output\033[0m"
+    tok_val = f"\033[33m{fmt_tok(primary_input)} input / {fmt_tok(out)} output\033[0m"
     rows.append(("📊 Tokens", tok_val))
 
     # Cache read (dim, only if nonzero)
     if cr > 0:
-        rows.append(("", f"\033[2m  ↳ cache-read: {fmt_tok(cr)}\033[0m"))
+        rows.append(("", f"\033[2m  > cache-read: {fmt_tok(cr)}\033[0m"))
 
     # Cost
     rows.append(("💰 Cost", f"${total_cost:.2f} (this op)"))
@@ -442,19 +442,19 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             c = estimate_cost(stats, model)
             mt = sum(stats[f] for f in ["input_tokens", "output_tokens",
                      "cache_creation_input_tokens", "cache_read_input_tokens"])
-            rows.append((f"  ↳ {shorten_model(model)}", f"{fmt_tok(mt)} tokens · ${c:.2f}"))
+            rows.append((f"  > {shorten_model(model)}", f"{fmt_tok(mt)} tokens / ${c:.2f}"))
 
     # Tools with per-tool token attribution
     tools_tokens = usage.get("tools_tokens", {})
     if top_tools:
-        tool_str = "  ".join(f"{t}×{c}" for t, c in top_tools)
+        tool_str = "  ".join(f"{t}x{c}" for t, c in top_tools)
         rows.append(("🔧 Tools", tool_str))
         # Per-tool token breakdown (show output tokens consumed by each tool)
         for t, c in top_tools:
             tt = tools_tokens.get(t, {})
             t_out = tt.get("output", 0)
             if t_out > 0:
-                rows.append(("", f"  ↳ {t}×{c}: {fmt_tok(t_out)} output"))
+                rows.append(("", f"  > {t}x{c}: {fmt_tok(t_out)} output"))
 
     # Files summary
     file_parts = []
@@ -462,7 +462,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     if fe: file_parts.append(f"{len(fe)} edited")
     if fw: file_parts.append(f"{len(fw)} written")
     if file_parts:
-        rows.append(("📁 Files", " · ".join(file_parts)))
+        rows.append(("📁 Files", " / ".join(file_parts)))
 
     # List edited files (most interesting)
     for f in fe[:5]:
