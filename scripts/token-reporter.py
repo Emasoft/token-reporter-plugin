@@ -424,7 +424,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # ANSI color palette for dark terminals
     # Principle: ONE color for all static/non-changing text (same as border),
     # bright colors ONLY for dynamic/changing values that pop out
-    S = "\033[90m"          # static - dark gray (same as border, for ALL non-changing text)
+    S = "\033[34m"          # static - blue (same as border, for ALL non-changing text)
     Y = "\033[93m"          # bright yellow - token values
     C = "\033[96m"          # bright cyan - cost values
     M = "\033[95m"          # bright magenta - per-tool token values
