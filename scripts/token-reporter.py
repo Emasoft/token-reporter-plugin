@@ -391,7 +391,7 @@ def _rel_path(filepath: str, project_dir: str) -> str:
 def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict) -> str:
     """Build a compact unicode-bordered report for terminal display."""
     is_sub = hook_event == "SubagentStop"
-    label = "🔹 Subagent" if is_sub else "🏁 Session"
+    label = "Subagent" if is_sub else "Session"
     agent_id = hook_input.get("agent_id", hook_input.get("session_id", ""))
     short_id = agent_id[:8] if agent_id else "?"
     project_dir = hook_input.get("cwd", "")
@@ -427,14 +427,14 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # Primary tokens (yellow) — fresh input + cache-write = actual new work
     primary_input = inp + cw
     tok_val = f"\033[33m{fmt_tok(primary_input)} input / {fmt_tok(out)} output\033[0m"
-    rows.append(("📊 Tokens", tok_val))
+    rows.append(("Tokens", tok_val))
 
     # Cache read (dim, only if nonzero)
     if cr > 0:
         rows.append(("", f"\033[2m  > cache-read: {fmt_tok(cr)}\033[0m"))
 
     # Cost
-    rows.append(("💰 Cost", f"${total_cost:.2f} (this op)"))
+    rows.append(("Cost", f"${total_cost:.2f} (this op)"))
 
     # Per-model breakdown (only if multiple real models)
     if len(real_models) > 1:
@@ -448,7 +448,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     tools_tokens = usage.get("tools_tokens", {})
     if top_tools:
         tool_str = "  ".join(f"{t}x{c}" for t, c in top_tools)
-        rows.append(("🔧 Tools", tool_str))
+        rows.append(("Tools", tool_str))
         # Per-tool token breakdown (show output tokens consumed by each tool)
         for t, c in top_tools:
             tt = tools_tokens.get(t, {})
@@ -462,25 +462,25 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     if fe: file_parts.append(f"{len(fe)} edited")
     if fw: file_parts.append(f"{len(fw)} written")
     if file_parts:
-        rows.append(("📁 Files", " / ".join(file_parts)))
+        rows.append(("Files", " / ".join(file_parts)))
 
     # List edited files (most interesting)
     for f in fe[:5]:
-        rows.append(("", f"  ✏️  {f}"))
+        rows.append(("", f"  * {f}"))
     if len(fe) > 5:
-        rows.append(("", f"  … +{len(fe) - 5} more"))
+        rows.append(("", f"  +{len(fe) - 5} more"))
 
     # List written files
     for f in fw[:3]:
-        rows.append(("", f"  📄 {f}"))
+        rows.append(("", f"  + {f}"))
     if len(fw) > 3:
-        rows.append(("", f"  … +{len(fw) - 3} more"))
+        rows.append(("", f"  +{len(fw) - 3} more"))
 
     # Subagent task
     if is_sub:
         task = identity.get("task_description", "")
         if task:
-            rows.append(("📋 Task", trunc(task, 60)))
+            rows.append(("Task", trunc(task, 60)))
 
     # ── Render unicode table ──
     # Emoji and CJK characters are 2 columns wide in terminals, but len() counts
