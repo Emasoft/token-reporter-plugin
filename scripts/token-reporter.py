@@ -44,6 +44,29 @@ import time
 from pathlib import Path
 from collections import defaultdict, Counter
 
+# ─────────────────────────────────────────────
+# Fast tokenizer — lazy-loaded singleton
+# ─────────────────────────────────────────────
+_tokenizer = None  # type: ignore
+_tokenizer_loaded = False
+
+
+def count_tokens(text: str) -> int:
+    """Count tokens using tiktoken cl100k_base (fast path: encode_ordinary).
+    Falls back to len(text)//4 if tiktoken is not installed."""
+    global _tokenizer, _tokenizer_loaded
+    if not _tokenizer_loaded:
+        _tokenizer_loaded = True
+        try:
+            import tiktoken
+            _tokenizer = tiktoken.get_encoding("cl100k_base")
+        except ImportError:
+            _tokenizer = None
+    if _tokenizer is not None:
+        # encode_ordinary skips special token handling — ~30% faster than encode
+        return len(_tokenizer.encode_ordinary(text))
+    return len(text) // 4
+
 
 # ─────────────────────────────────────────────
 # Pricing
@@ -268,7 +291,7 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
             "message_count": 0,
         }),
         "tools_used": Counter(),
-        "tools_tokens": defaultdict(lambda: {"input": 0, "output": 0, "result_chars": 0}),
+        "tools_tokens": defaultdict(lambda: {"input": 0, "output": 0, "result_tokens": 0}),
         "files_read": set(), "files_written": set(), "files_edited": set(),
         "bash_commands": [], "web_fetches": [],
     }
@@ -321,19 +344,19 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
                     tool_name = tool_use_id_map.get(tuid, "")
                     if not tool_name:
                         continue
-                    # Measure content size — this is what gets tokenized as input
+                    # Tokenize the tool result — this is what gets fed as input tokens
                     result_content = block.get("content", "")
                     if isinstance(result_content, list):
                         # Content can be list of blocks (text, image, etc.)
-                        char_count = sum(
-                            len(b.get("text", "")) if isinstance(b, dict) else len(str(b))
+                        text = " ".join(
+                            b.get("text", "") if isinstance(b, dict) else str(b)
                             for b in result_content
                         )
                     elif isinstance(result_content, str):
-                        char_count = len(result_content)
+                        text = result_content
                     else:
-                        char_count = len(str(result_content))
-                    r["tools_tokens"][tool_name]["result_chars"] += char_count
+                        text = str(result_content)
+                    r["tools_tokens"][tool_name]["result_tokens"] += count_tokens(text)
             continue
 
         # ── Process assistant entries ──
@@ -513,9 +536,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             tt = tools_tokens.get(t, {})
             t_inp = tt.get("input", 0)
             t_out = tt.get("output", 0)
-            result_chars = tt.get("result_chars", 0)
-            # Estimate result tokens from char count (~4 chars per token)
-            result_toks = result_chars // 4 if result_chars > 0 else 0
+            result_toks = tt.get("result_tokens", 0)
             parts = []
             if t_inp > 0:
                 parts.append(f"{Y}{fmt_tok(t_inp)}{R} {S}in{R}")
@@ -523,7 +544,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
                 parts.append(f"{Y}{fmt_tok(t_out)}{R} {S}out{R}")
             if result_toks > 0:
                 # What the tool returned and got fed back as input tokens
-                parts.append(f"{Y}~{fmt_tok(result_toks)}{R} {S}result→input{R}")
+                parts.append(f"{Y}{fmt_tok(result_toks)}{R} {S}result→input{R}")
             if parts:
                 detail = f" {S}/{R} ".join(parts)
                 rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{S}:{R} {detail}"))
