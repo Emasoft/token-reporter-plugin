@@ -521,9 +521,8 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
                 parts.append(f"{Y}{fmt_tok(t_inp)}{R} {S}in{R}")
             if t_out > 0:
                 parts.append(f"{Y}{fmt_tok(t_out)}{R} {S}out{R}")
-            if result_toks > 1000:
-                # Show result size when significant (>1K tokens) — this is
-                # what the tool returned and got fed back as input tokens
+            if result_toks > 0:
+                # What the tool returned and got fed back as input tokens
                 parts.append(f"{Y}~{fmt_tok(result_toks)}{R} {S}result→input{R}")
             if parts:
                 detail = f" {S}/{R} ".join(parts)
