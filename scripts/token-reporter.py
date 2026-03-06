@@ -182,37 +182,54 @@ def _get_oauth_token() -> str:
     return ""
 
 
-def _fetch_usage_api() -> dict:
-    """Fetch current usage limits from Anthropic API.
-    Falls back to statusline cache if API call fails (e.g. 429 rate limit)."""
-    token = _get_oauth_token()
-    if not token:
-        return _read_statusline_cache()
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            "https://api.anthropic.com/api/oauth/usage",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": "oauth-2025-04-20",
-                "User-Agent": "claude-code/2.1.69",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read())
-    except Exception:
-        # Fall back to statusline's cached data (refreshed every 60s)
-        return _read_statusline_cache()
+# Shared cache with statusline — both scripts read/write the same file
+# so only one API call happens per TTL window regardless of who runs first
+_USAGE_CACHE_FILE = Path("/tmp/claude/usage-cache.json")
+_USAGE_CACHE_TTL = 120  # seconds — must match statusline.sh cache_max_age
 
 
-def _read_statusline_cache() -> dict:
-    """Read the statusline's usage cache as fallback."""
-    cache_file = Path("/tmp/claude/statusline-usage-cache.json")
-    if cache_file.exists():
+def _fetch_usage() -> dict:
+    """Get usage limits: shared cache first, API call only if stale."""
+    # 1. Check shared cache freshness
+    if _USAGE_CACHE_FILE.exists():
         try:
-            return json.loads(cache_file.read_text(encoding="utf-8"))
+            cache_age = time.time() - _USAGE_CACHE_FILE.stat().st_mtime
+            if cache_age < _USAGE_CACHE_TTL:
+                return json.loads(_USAGE_CACHE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 2. Cache stale or missing — fetch from API
+    token = _get_oauth_token()
+    if token:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.anthropic.com/api/oauth/usage",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "User-Agent": "claude-code/2.1.69",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                # Update shared cache for both statusline and token-reporter
+                try:
+                    _USAGE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    _USAGE_CACHE_FILE.write_text(json.dumps(data), encoding="utf-8")
+                except OSError:
+                    pass
+                return data
+        except Exception:
+            pass
+
+    # 3. API failed — return stale cache if any
+    if _USAGE_CACHE_FILE.exists():
+        try:
+            return json.loads(_USAGE_CACHE_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
     return {}
@@ -269,8 +286,8 @@ def fetch_usage_with_delta() -> tuple:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Fetch fresh data from API
-    current = _fetch_usage_api()
+    # Fetch current data (shared cache or API)
+    current = _fetch_usage()
     if not current:
         return {}, {}
 
