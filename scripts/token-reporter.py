@@ -618,23 +618,32 @@ def main():
         identity["subagent_type"] = agent_type
 
     # Step 2: Token usage from agent's own transcript
-    # For Stop events, wait briefly for the transcript to be flushed to disk —
-    # the hook fires before the current response is written to the JSONL file
-    if hook_event == "Stop":
-        dbg("waiting 3s for transcript flush...")
-        time.sleep(3)
+    # For Stop events, the hook fires before the current response is written to
+    # the JSONL file. We retry with backoff until new assistant messages appear.
+    usage = {}  # type: dict
+    max_retries = 6 if hook_event == "Stop" else 1
+    retry_delay = 1.0  # seconds between retries for Stop events
 
-    if agent_transcript_path and Path(agent_transcript_path).exists():
-        dbg(f"parsing agent transcript: {agent_transcript_path}")
-        usage = parse_agent_transcript(agent_transcript_path, session_id="")
-    elif transcript_path:
-        # For Stop events, only count tokens since last user prompt (this operation)
-        is_stop = hook_event == "Stop"
-        dbg(f"parsing session transcript: {transcript_path} last_op_only={is_stop}")
-        usage = parse_agent_transcript(transcript_path, session_id=session_id, last_op_only=is_stop)
-    else:
-        dbg("exit: no transcript path found")
-        sys.exit(0)
+    for attempt in range(max_retries):
+        if attempt > 0:
+            dbg(f"retry {attempt}/{max_retries-1}, waiting {retry_delay}s for transcript flush...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 1.5, 5.0)  # backoff: 1s, 1.5s, 2.25s, 3.4s, 5s
+
+        if agent_transcript_path and Path(agent_transcript_path).exists():
+            dbg(f"parsing agent transcript: {agent_transcript_path}")
+            usage = parse_agent_transcript(agent_transcript_path, session_id="")
+        elif transcript_path:
+            is_stop = hook_event == "Stop"
+            dbg(f"parsing session transcript: {transcript_path} last_op_only={is_stop}")
+            usage = parse_agent_transcript(transcript_path, session_id=session_id, last_op_only=is_stop)
+        else:
+            dbg("exit: no transcript path found")
+            sys.exit(0)
+
+        if usage["message_count"] > 0:
+            break  # found messages, proceed
+        dbg(f"attempt {attempt}: message_count=0")
 
     dbg(f"messages={usage['message_count']} inp={usage['input_tokens']} out={usage['output_tokens']} cw={usage['cache_creation_input_tokens']} cr={usage['cache_read_input_tokens']}")
     dbg(f"tools={dict(usage.get('tools_used', {}))}")
