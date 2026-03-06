@@ -62,7 +62,7 @@ def count_tokens(text: str) -> int:
             _tokenizer = tiktoken.get_encoding("cl100k_base")
         except ImportError:
             _tokenizer = None
-            print("[token-reporter] tiktoken not found — result token counts will be approximate. Install with: pip install tiktoken (or ensure hooks.json uses 'uv run --with tiktoken')", file=sys.stderr)
+            print("[token-reporter] WARNING: tiktoken not found — token counts will be approximate. Run via 'uv run --with tiktoken' to get exact counts.", file=sys.stderr)
     if _tokenizer is not None:
         # encode_ordinary skips special token handling — ~30% faster than encode
         return len(_tokenizer.encode_ordinary(text))
