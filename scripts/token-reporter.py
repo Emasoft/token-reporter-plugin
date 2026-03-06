@@ -268,7 +268,7 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
             "message_count": 0,
         }),
         "tools_used": Counter(),
-        "tools_tokens": defaultdict(lambda: {"input": 0, "output": 0}),
+        "tools_tokens": defaultdict(lambda: {"input": 0, "output": 0, "result_chars": 0}),
         "files_read": set(), "files_written": set(), "files_edited": set(),
         "bash_commands": [], "web_fetches": [],
     }
@@ -302,8 +302,42 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
         if last_user_idx >= 0:
             start_index = last_user_idx + 1
 
+    # Map tool_use_id -> tool_name so we can attribute tool_result costs
+    tool_use_id_map = {}  # type: dict[str, str]
+
     for entry in all_entries[start_index:]:
-        if entry.get("type") != "assistant" or "message" not in entry:
+        etype = entry.get("type", "")
+
+        # ── Process user entries: scan tool_result blocks for content size ──
+        if etype == "user":
+            msg = entry.get("message", {})
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    # Match this tool_result back to its originating tool
+                    tuid = block.get("tool_use_id", "")
+                    tool_name = tool_use_id_map.get(tuid, "")
+                    if not tool_name:
+                        continue
+                    # Measure content size — this is what gets tokenized as input
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, list):
+                        # Content can be list of blocks (text, image, etc.)
+                        char_count = sum(
+                            len(b.get("text", "")) if isinstance(b, dict) else len(str(b))
+                            for b in result_content
+                        )
+                    elif isinstance(result_content, str):
+                        char_count = len(result_content)
+                    else:
+                        char_count = len(str(result_content))
+                    r["tools_tokens"][tool_name]["result_chars"] += char_count
+            continue
+
+        # ── Process assistant entries ──
+        if etype != "assistant" or "message" not in entry:
             continue
         if session_id:
             sid = entry.get("sessionId", entry.get("session_id", ""))
@@ -338,6 +372,10 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
             tn = block.get("name", "unknown")
             msg_tools.append(tn)
             r["tools_used"][tn] += 1
+            # Record tool_use_id -> tool_name for matching tool_results
+            tuid = block.get("id", "")
+            if tuid:
+                tool_use_id_map[tuid] = tn
             ti = block.get("input", {})
             if not isinstance(ti, dict):
                 continue
@@ -446,9 +484,13 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     tok_val = f"{Y}{fmt_tok(primary_input)}{R} {S}input{R} {S}/{R} {Y}{fmt_tok(out)}{R} {S}output{R}"
     rows.append(("Tokens", tok_val))
 
-    # Cache read (all static except the value)
+    # Cache write — counted toward rate limits
+    if cw > 0:
+        rows.append(("", f"{S}  L cache-write (included):{R} {Y}{fmt_tok(cw)}{R}"))
+
+    # Cache read — NOT counted toward rate limits
     if cr > 0:
-        rows.append(("", f"{S}  L cache-read:{R} {Y}{fmt_tok(cr)}{R}"))
+        rows.append(("", f"{S}  L cache-read (excluded):{R} {Y}{fmt_tok(cr)}{R}"))
 
     # Cost (bright cyan value, static label)
     rows.append(("Cost", f"{C}${total_cost:.2f}{R} {S}(this op){R}"))
@@ -466,12 +508,26 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     if top_tools:
         tool_str = f" {S}/{R} ".join(f"{W}{t}{R} {G}x{c}{R}" for t, c in top_tools)
         rows.append(("Tools", tool_str))
-        # Per-tool token breakdown
+        # Per-tool token breakdown — show input, output, and result content size
         for t, c in top_tools:
             tt = tools_tokens.get(t, {})
+            t_inp = tt.get("input", 0)
             t_out = tt.get("output", 0)
+            result_chars = tt.get("result_chars", 0)
+            # Estimate result tokens from char count (~4 chars per token)
+            result_toks = result_chars // 4 if result_chars > 0 else 0
+            parts = []
+            if t_inp > 0:
+                parts.append(f"{Y}{fmt_tok(t_inp)}{R} {S}in{R}")
             if t_out > 0:
-                rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{S}:{R} {Y}{fmt_tok(t_out)}{R} {S}output{R}"))
+                parts.append(f"{Y}{fmt_tok(t_out)}{R} {S}out{R}")
+            if result_toks > 1000:
+                # Show result size when significant (>1K tokens) — this is
+                # what the tool returned and got fed back as input tokens
+                parts.append(f"{Y}~{fmt_tok(result_toks)}{R} {S}result→input{R}")
+            if parts:
+                detail = f" {S}/{R} ".join(parts)
+                rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{S}:{R} {detail}"))
 
     # Files summary (counts bright, labels static)
     file_parts = []
