@@ -57,7 +57,8 @@ MODEL_PRICING = {
     "claude-sonnet-4":   {"input": 3.0,  "output": 15.0, "cache_write": 3.75,  "cache_read": 0.30},
     "claude-opus-4":     {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
     "claude-opus-4-1":   {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
-    "claude-haiku-3-5":  {"input": 0.25, "output": 1.25, "cache_write": 0.30,  "cache_read": 0.03},
+    "claude-haiku-3-5":  {"input": 0.80, "output": 4.0,  "cache_write": 1.00,  "cache_read": 0.08},
+    "claude-haiku-3":    {"input": 0.25, "output": 1.25, "cache_write": 0.30,  "cache_read": 0.03},
 }
 DEFAULT_PRICING = {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}
 
