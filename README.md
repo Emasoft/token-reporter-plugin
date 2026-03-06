@@ -60,28 +60,42 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ## Installation
 
-### 1. Copy the plugin
+### From the emasoft-plugins marketplace (recommended)
+
+Add the marketplace to `~/.claude/settings.json` if you haven't already:
+
+```json
+{
+  "pluginMarketplaces": [
+    "Emasoft/emasoft-plugins"
+  ]
+}
+```
+
+Then enable the plugin:
+
+```json
+{
+  "enabledPlugins": {
+    "token-reporter@emasoft-plugins": true
+  }
+}
+```
+
+Restart Claude Code or run `/reload-plugins` to activate.
+
+### Manual installation (development)
 
 ```bash
-# From the repo root, copy to the local marketplace
+# Clone the repo
+git clone https://github.com/Emasoft/emasoft-plugins.git /tmp/emasoft-plugins
+
+# Copy the plugin to a local marketplace
 mkdir -p ~/.claude/plugins/marketplaces/local-marketplace/plugins/
-cp -r token-reporter ~/.claude/plugins/marketplaces/local-marketplace/plugins/token-reporter
+cp -r /tmp/emasoft-plugins/plugins/token-reporter ~/.claude/plugins/marketplaces/local-marketplace/plugins/token-reporter
 ```
 
-The plugin directory structure must be:
-```
-~/.claude/plugins/marketplaces/local-marketplace/plugins/token-reporter/
-  .claude-plugin/
-    plugin.json          # Plugin manifest
-  hooks/
-    hooks.json           # Hook event → command mapping
-  scripts/
-    token-reporter.py    # Main hook script
-```
-
-### 2. Enable the plugin
-
-Add to `~/.claude/settings.json` under `enabledPlugins`:
+Then enable in `~/.claude/settings.json`:
 
 ```json
 {
@@ -91,11 +105,19 @@ Add to `~/.claude/settings.json` under `enabledPlugins`:
 }
 ```
 
-If `enabledPlugins` already exists, merge the entry into the existing object.
+Restart Claude Code or run `/reload-plugins` to activate.
 
-### 3. Activate
+### Plugin directory structure
 
-Either restart Claude Code or run `/reload-plugins` in an active session.
+```
+token-reporter/
+  .claude-plugin/
+    plugin.json          # Plugin manifest
+  hooks/
+    hooks.json           # Hook event → command mapping
+  scripts/
+    token-reporter.py    # Main hook script
+```
 
 ### 4. Verify
 
