@@ -184,7 +184,7 @@ def _get_oauth_token() -> str:
 
 # Token reporter's own usage cache — independent from any other script
 _USAGE_CACHE_FILE = Path(tempfile.gettempdir()) / "token-reporter" / "usage-cache.json"
-_USAGE_CACHE_TTL = 120  # seconds between API calls
+_USAGE_CACHE_TTL = 300  # 5 minutes — the /api/oauth/usage endpoint is heavily rate-limited
 
 
 def _fetch_usage() -> dict:
