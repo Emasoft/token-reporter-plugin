@@ -182,15 +182,14 @@ def _get_oauth_token() -> str:
     return ""
 
 
-# Shared cache with statusline — both scripts read/write the same file
-# so only one API call happens per TTL window regardless of who runs first
-_USAGE_CACHE_FILE = Path("/tmp/claude/usage-cache.json")
-_USAGE_CACHE_TTL = 120  # seconds — must match statusline.sh cache_max_age
+# Token reporter's own usage cache — independent from any other script
+_USAGE_CACHE_FILE = Path(tempfile.gettempdir()) / "token-reporter" / "usage-cache.json"
+_USAGE_CACHE_TTL = 120  # seconds between API calls
 
 
 def _fetch_usage() -> dict:
-    """Get usage limits: shared cache first, API call only if stale."""
-    # 1. Check shared cache freshness
+    """Get usage limits: own cache first, API call only if stale."""
+    # 1. Check own cache freshness
     if _USAGE_CACHE_FILE.exists():
         try:
             cache_age = time.time() - _USAGE_CACHE_FILE.stat().st_mtime
@@ -216,7 +215,6 @@ def _fetch_usage() -> dict:
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
-                # Update shared cache for both statusline and token-reporter
                 try:
                     _USAGE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
                     _USAGE_CACHE_FILE.write_text(json.dumps(data), encoding="utf-8")
