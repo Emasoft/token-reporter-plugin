@@ -41,11 +41,8 @@ import json
 import sys
 import re
 import time
-import os
-import subprocess
 import tempfile
 from pathlib import Path
-from datetime import datetime, timezone
 from collections import defaultdict, Counter
 
 # ─────────────────────────────────────────────
@@ -145,165 +142,6 @@ def trunc(text: str, max_len: int = 100) -> str:
     text = text.replace("\n", " ").replace("|", "\\|").strip()
     return text if len(text) <= max_len else text[:max_len - 1] + "…"
 
-
-# ─────────────────────────────────────────────
-# Rate limit tracking (5h / 7d usage)
-# ─────────────────────────────────────────────
-
-def _get_oauth_token() -> str:
-    """Get OAuth token from env var, macOS Keychain, or creds file."""
-    # 1. Env var override
-    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
-    if token:
-        return token
-    # 2. macOS Keychain
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            creds = json.loads(result.stdout.strip())
-            token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-            if token:
-                return token
-    except (FileNotFoundError, json.JSONDecodeError, subprocess.TimeoutExpired, OSError):
-        pass
-    # 3. Linux creds file
-    creds_file = Path.home() / ".claude" / ".credentials.json"
-    if creds_file.exists():
-        try:
-            creds = json.loads(creds_file.read_text(encoding="utf-8"))
-            token = creds.get("claudeAiOauth", {}).get("accessToken", "")
-            if token:
-                return token
-        except (json.JSONDecodeError, OSError):
-            pass
-    return ""
-
-
-# Token reporter's own usage cache — independent from any other script
-_USAGE_CACHE_FILE = Path(tempfile.gettempdir()) / "token-reporter" / "usage-cache.json"
-_USAGE_CACHE_TTL = 300  # 5 minutes — the /api/oauth/usage endpoint is heavily rate-limited
-
-
-def _fetch_usage() -> dict:
-    """Get usage limits: own cache first, API call only if stale."""
-    # 1. Check own cache freshness
-    if _USAGE_CACHE_FILE.exists():
-        try:
-            cache_age = time.time() - _USAGE_CACHE_FILE.stat().st_mtime
-            if cache_age < _USAGE_CACHE_TTL:
-                return json.loads(_USAGE_CACHE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # 2. Cache stale or missing — fetch from API
-    token = _get_oauth_token()
-    if token:
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                "https://api.anthropic.com/api/oauth/usage",
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {token}",
-                    "anthropic-beta": "oauth-2025-04-20",
-                    "User-Agent": "claude-code/2.1.69",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read())
-                try:
-                    _USAGE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    _USAGE_CACHE_FILE.write_text(json.dumps(data), encoding="utf-8")
-                except OSError:
-                    pass
-                return data
-        except Exception:
-            pass
-
-    # 3. API failed — return stale cache if any
-    if _USAGE_CACHE_FILE.exists():
-        try:
-            return json.loads(_USAGE_CACHE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def _format_reset_time(iso_str: str, style: str = "time") -> str:
-    """Format ISO reset timestamp to compact local time."""
-    if not iso_str or iso_str == "null":
-        return ""
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        local_dt = dt.astimezone()
-        if style == "time":
-            return local_dt.strftime("%I:%M%p").lstrip("0").lower()
-        elif style == "datetime":
-            # "mar 8, 4:00pm"
-            return local_dt.strftime("%b %-d, %I:%M%p").lstrip("0").lower()
-        else:
-            return local_dt.strftime("%b %-d").lower()
-    except (ValueError, TypeError):
-        return ""
-
-
-def _build_limit_bar(pct: float, width: int = 8) -> str:
-    """Build a colored progress bar for rate limit display."""
-    pct = max(0.0, min(100.0, pct))
-    filled = int(pct * width / 100)
-    empty = width - filled
-    # Color by severity
-    if pct >= 90:
-        bar_color = "\033[91m"      # bright red
-    elif pct >= 70:
-        bar_color = "\033[93m"      # bright yellow
-    elif pct >= 50:
-        bar_color = "\033[33m"      # orange
-    else:
-        bar_color = "\033[92m"      # bright green
-    dim = "\033[2m"
-    reset = "\033[0m"
-    return f"{bar_color}{'█' * filled}{dim}{'░' * empty}{reset}"
-
-
-def fetch_usage_with_delta() -> tuple:
-    """Fetch current rate limits and compute delta from last cached snapshot.
-    Returns (current_data: dict, delta: dict).
-    Delta has keys like 'five_hour' / 'seven_day' with 'utilization_delta' float."""
-    cache_file = Path(tempfile.gettempdir()) / "token-reporter" / "usage-before.json"
-
-    # Read previous snapshot (the "before" value)
-    before = {}  # type: dict
-    if cache_file.exists():
-        try:
-            before = json.loads(cache_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # Fetch current data (shared cache or API)
-    current = _fetch_usage()
-    if not current:
-        return {}, {}
-
-    # Save current as next "before"
-    try:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(current), encoding="utf-8")
-    except OSError:
-        pass
-
-    # Calculate deltas
-    delta = {}  # type: dict
-    for period in ("five_hour", "seven_day"):
-        cur_util = current.get(period, {}).get("utilization", 0)
-        prev_util = before.get(period, {}).get("utilization", 0)
-        delta[period] = {"utilization_delta": cur_util - prev_util}
-
-    return current, delta
 
 
 # ─────────────────────────────────────────────
@@ -615,8 +453,7 @@ def _rel_path(filepath: str, project_dir: str) -> str:
             return filepath
 
 
-def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
-                 usage_limits: dict | None = None, usage_delta: dict | None = None) -> str:
+def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict) -> str:
     """Build a compact unicode-bordered report for terminal display."""
     is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
     # Show the hook event type as the label for teammate/task events
@@ -740,39 +577,6 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
         task = identity.get("task_description", "")
         if task:
             rows.append(("Task", trunc(task, 60)))
-
-    # Rate limit bars (only for Stop events, when usage_limits is provided)
-    if usage_limits:
-        _delta = usage_delta or {}
-        for i, (period, lbl, reset_style) in enumerate([
-            ("five_hour", "5h", "time"),
-            ("seven_day", "7d", "datetime"),
-        ]):
-            pdata = usage_limits.get(period, {})
-            util = pdata.get("utilization", 0)
-            reset_at = pdata.get("resets_at", "")
-            d_util = _delta.get(period, {}).get("utilization_delta", 0)
-            # Bar
-            bar = _build_limit_bar(util)
-            # Delta string — positive in yellow, negative in green (reset happened)
-            if d_util > 0.05:
-                delta_str = f" {Y}(+{d_util:.1f}%){R}"
-            elif d_util < -0.05:
-                delta_str = f" {C}({d_util:.1f}%){R}"
-            else:
-                delta_str = ""
-            # Reset time
-            reset_str = f" {S}@{_format_reset_time(reset_at, reset_style)}{R}" if reset_at else ""
-            # First row gets the label
-            row_label = "Limits" if i == 0 else ""
-            rows.append((row_label, f"{W}{lbl}{R} {bar} {C}{util:.0f}%{R}{delta_str}{reset_str}"))
-
-        # Extra usage if enabled
-        extra = usage_limits.get("extra_usage", {})
-        if extra.get("is_enabled"):
-            extra_used = extra.get("used_credits", 0) / 100
-            extra_limit = extra.get("monthly_limit", 0) / 100
-            rows.append(("", f"{W}extra{R} {C}${extra_used:.2f}{R}{S}/${R}{C}${extra_limit:.2f}{R}"))
 
     # ── Render unicode table ──
     # Emoji and CJK characters are 2 columns wide in terminals, but len() counts
@@ -928,23 +732,8 @@ def main():
         dbg("exit: message_count=0")
         sys.exit(0)
 
-    # Step 3: Fetch rate limits (only for Stop events — displayed in the final report)
-    usage_limits = {}  # type: dict
-    usage_delta = {}  # type: dict
-    if not is_subagent_event:
-        dbg("fetching rate limits from API...")
-        try:
-            usage_limits, usage_delta = fetch_usage_with_delta()
-            if usage_limits:
-                dbg(f"5h={usage_limits.get('five_hour',{}).get('utilization',0):.1f}% "
-                    f"7d={usage_limits.get('seven_day',{}).get('utilization',0):.1f}%")
-            else:
-                dbg("rate limits: API returned empty (no token or network error)")
-        except Exception as e:
-            dbg(f"rate limits fetch failed: {e}")
-
-    # Step 4: Build report
-    report = build_report(hook_event, hook_input, usage, identity, usage_limits, usage_delta)
+    # Step 3: Build report
+    report = build_report(hook_event, hook_input, usage, identity)
     dbg(f"report built, length={len(report)}")
 
     # SubagentStop systemMessage is not rendered to the terminal by Claude Code,
