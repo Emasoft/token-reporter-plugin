@@ -36,13 +36,10 @@ After each Claude Code response, a compact unicode-bordered report appears in th
 │            L Bash x12: 2.0K out / 1.4K result→input      │
 │            L Edit x3: 890 out / 245 result→input         │
 │            L Read x2: 251 out / 6.3K result→input        │
-│ MCP      │ 5 tools / x14 calls                           │
-│            ┌ chrome-devtools                              │
-│            L take_screenshot x3: 2.1K r→in               │
-│            L navigate_page x2: 89 out / 1.2K r→in        │
-│            ┌ grepika                                      │
-│            L search x5: 200 out / 3.1K r→in              │
-│            L outline x4: 150 out / 2.8K r→in             │
+│ MCP      │ 3 tools / x10 calls                                             │
+│            L mcp__chrome-devtools__take_screenshot x3: 2.1K result→input    │
+│            L mcp__chrome-devtools__navigate_page x2: 89 out / 1.2K r→input  │
+│            L mcp__grepika__search x5: 200 out / 3.1K result→input           │
 │ Files    │ 2 read / 1 edited                              │
 │            * scripts/token-reporter.py                    │
 ╰──────────────────────────────────────────────────────────╯
@@ -56,10 +53,10 @@ After each Claude Code response, a compact unicode-bordered report appears in th
 
 ### MCP tools section
 
-MCP tool names (e.g. `mcp__chrome-devtools__take_screenshot`) are too long for inline display. They get their own **MCP** section, grouped by server name with each method on its own line:
+MCP tool names (e.g. `mcp__chrome-devtools__take_screenshot`) are too long for inline display on the `Tools` row. They get their own **MCP** section, listed vertically one per line with the full tool name:
 
-- **`┌ server-name`** — server group header
-- **`L method x3: 200 out / 3.1K r→in`** — method name, call count, and token breakdown
+- **`MCP`** row shows total tool count and call count
+- Each tool listed below with full name, call count, and token breakdown
 
 ## Prerequisites
 
