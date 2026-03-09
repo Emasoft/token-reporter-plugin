@@ -595,6 +595,13 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     if len(fw) > 3:
         rows.append(("", f"  {S}+{len(fw) - 3} more{R}"))
 
+    # List read files (only if no edited/written files are listed, to avoid clutter)
+    if not fe and not fw:
+        for f in fr[:5]:
+            rows.append(("", f"  {S}·{R} {W}{f}{R}"))
+        if len(fr) > 5:
+            rows.append(("", f"  {S}+{len(fr) - 5} more{R}"))
+
     # Subagent task
     if is_sub:
         task = identity.get("task_description", "")
