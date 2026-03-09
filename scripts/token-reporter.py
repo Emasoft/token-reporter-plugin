@@ -143,6 +143,19 @@ def trunc(text: str, max_len: int = 100) -> str:
     return text if len(text) <= max_len else text[:max_len - 1] + "…"
 
 
+def parse_mcp_tool(name: str):
+    """Parse MCP tool name into (server, method). Returns None for non-MCP tools.
+    e.g. 'mcp__chrome-devtools__take_screenshot' → ('chrome-devtools', 'take_screenshot')
+    """
+    if not name.startswith("mcp__"):
+        return None
+    rest = name[5:]  # strip 'mcp__' prefix
+    # Split on double-underscore to get server and tool method
+    parts = rest.split("__", 1)
+    if len(parts) == 2:
+        return (parts[0], parts[1])
+    return (rest, rest)
+
 
 # ─────────────────────────────────────────────
 # JSONL helpers
@@ -475,10 +488,12 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     cr = usage["cache_read_input_tokens"]
     msgs = usage["message_count"]
 
-    # Tools
+    # Tools — separate regular tools from MCP tools (long names break box width)
     tools = usage.get("tools_used", {})
-    top_tools = (tools.most_common(6) if hasattr(tools, 'most_common')
-                 else sorted(tools.items(), key=lambda x: -x[1])[:6])
+    all_top_tools = (tools.most_common(20) if hasattr(tools, 'most_common')
+                     else sorted(tools.items(), key=lambda x: -x[1])[:20])
+    regular_tools = [(t, c) for t, c in all_top_tools if not t.startswith("mcp__")]
+    mcp_tools_list = [(t, c) for t, c in all_top_tools if t.startswith("mcp__")]
 
     # Files — relative to project
     fw = [_rel_path(f, project_dir) for f in usage.get("files_written", [])]
@@ -529,13 +544,15 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
                      "cache_creation_input_tokens", "cache_read_input_tokens"])
             rows.append((f"{S}  L {shorten_model(model)}{R}", f"{Y}{fmt_tok(mt)}{R} {S}tokens /{R} {C}${c:.2f}{R}"))
 
-    # Tools with per-tool token attribution
+    # Regular tools with per-tool token attribution
     tools_tokens = usage.get("tools_tokens", {})
-    if top_tools:
-        tool_str = f" {S}/{R} ".join(f"{W}{t}{R} {G}x{c}{R}" for t, c in top_tools)
+    if regular_tools:
+        tool_str = f" {S}/{R} ".join(f"{W}{t}{R} {G}x{c}{R}" for t, c in regular_tools[:6])
+        if len(regular_tools) > 6:
+            tool_str += f" {S}+{len(regular_tools) - 6} more{R}"
         rows.append(("Tools", tool_str))
-        # Per-tool token breakdown — show input, output, and result content size
-        for t, c in top_tools:
+        # Per-tool token breakdown for regular tools
+        for t, c in regular_tools[:6]:
             tt = tools_tokens.get(t, {})
             t_inp = tt.get("input", 0)
             t_out = tt.get("output", 0)
@@ -546,11 +563,47 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             if t_out > 0:
                 parts.append(f"{Y}{fmt_tok(t_out)}{R} {S}out{R}")
             if result_toks > 0:
-                # What the tool returned and got fed back as input tokens
                 parts.append(f"{Y}{fmt_tok(result_toks)}{R} {S}result→input{R}")
             if parts:
                 detail = f" {S}/{R} ".join(parts)
                 rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{S}:{R} {detail}"))
+
+    # MCP tools — separate columnar section to keep box width manageable
+    if mcp_tools_list:
+        # Group by MCP server, preserving insertion order
+        mcp_by_server = {}
+        server_order = []
+        for t, c in mcp_tools_list:
+            parsed = parse_mcp_tool(t)
+            server, method = parsed if parsed else (t, t)
+            if server not in mcp_by_server:
+                mcp_by_server[server] = []
+                server_order.append(server)
+            mcp_by_server[server].append((method, c, t))
+
+        # MCP summary row
+        total_mcp_calls = sum(c for _, c in mcp_tools_list)
+        rows.append(("MCP", f"{W}{len(mcp_tools_list)}{R} {S}tools{R} {S}/{R} {G}x{total_mcp_calls}{R} {S}calls{R}"))
+
+        # Per-server columnar listing
+        for server in server_order:
+            methods = mcp_by_server[server]
+            rows.append(("", f"{S}  ┌ {W}{server}{R}"))
+            for method, count, original_name in methods:
+                tt = tools_tokens.get(original_name, {})
+                t_inp = tt.get("input", 0)
+                t_out = tt.get("output", 0)
+                result_toks = tt.get("result_tokens", 0)
+                parts = []
+                if t_inp > 0:
+                    parts.append(f"{Y}{fmt_tok(t_inp)}{R} {S}in{R}")
+                if t_out > 0:
+                    parts.append(f"{Y}{fmt_tok(t_out)}{R} {S}out{R}")
+                if result_toks > 0:
+                    parts.append(f"{Y}{fmt_tok(result_toks)}{R} {S}r→in{R}")
+                detail = f" {S}/{R} ".join(parts) if parts else ""
+                detail_str = f"{S}:{R} {detail}" if detail else ""
+                rows.append(("", f"{S}  L{R} {W}{method}{R} {G}x{count}{R}{detail_str}"))
 
     # Files summary (counts bright, labels static)
     file_parts = []

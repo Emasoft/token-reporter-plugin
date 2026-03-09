@@ -14,38 +14,52 @@ After each Claude Code response, a compact unicode-bordered report appears in th
 - **Files touched** — read, edited, written
 
 ```
-╭────────────────────────────────────────────────────────────╮
-│ Subagent Explore ae3d16d9 | haiku-4-5 | 3 messages         │
-├────────────────────────────────────────────────────────────┤
-│ Tokens       │ 34.8K input / 573 output                    │
-│                L cache-write (included): 2.1K               │
-│                L cache-read (excluded): 12.4K               │
-│ Cost         │ $0.04 (this op)                              │
-│ Tools        │ WebFetch x1 / Bash x2                        │
-│                L WebFetch x1: 144 out / 85.2K result→input  │
-│                L Bash x2: 429 out / 312 result→input        │
-╰────────────────────────────────────────────────────────────╯
-╭────────────────────────────────────────────────────────────╮
-│ Session 2779c422 | opus-4-6 | 15 messages                  │
-├────────────────────────────────────────────────────────────┤
-│ Tokens       │ 367.5K input / 1.1K output                  │
-│                L cache-write (included): 54.8K              │
-│                L cache-read (excluded): 528.5K              │
-│ Cost         │ $2.59 (this op)                              │
-│ Tools        │ Bash x12 / Edit x3 / Read x2                │
-│                L Bash x12: 2.0K out / 1.4K result→input    │
-│                L Edit x3: 890 out / 245 result→input       │
-│                L Read x2: 251 out / 6.3K result→input      │
-│ Files        │ 2 read / 1 edited                            │
-│                * scripts/token-reporter.py                  │
-╰────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────╮
+│ Subagent Explore ae3d16d9 | haiku-4-5 | 3 messages       │
+├──────────────────────────────────────────────────────────┤
+│ Tokens   │ 34.8K input / 573 output                      │
+│            L cache-write (included): 2.1K                 │
+│            L cache-read (excluded): 12.4K                 │
+│ Cost     │ $0.04 (this op)                                │
+│ Tools    │ WebFetch x1 / Bash x2                          │
+│            L WebFetch x1: 144 out / 85.2K result→input    │
+│            L Bash x2: 429 out / 312 result→input          │
+╰──────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────╮
+│ Session 2779c422 | opus-4-6 | 15 messages                │
+├──────────────────────────────────────────────────────────┤
+│ Tokens   │ 367.5K input / 1.1K output                    │
+│            L cache-write (included): 54.8K                │
+│            L cache-read (excluded): 528.5K                │
+│ Cost     │ $2.59 (this op)                                │
+│ Tools    │ Bash x12 / Edit x3 / Read x2                  │
+│            L Bash x12: 2.0K out / 1.4K result→input      │
+│            L Edit x3: 890 out / 245 result→input         │
+│            L Read x2: 251 out / 6.3K result→input        │
+│ MCP      │ 5 tools / x14 calls                           │
+│            ┌ chrome-devtools                              │
+│            L take_screenshot x3: 2.1K r→in               │
+│            L navigate_page x2: 89 out / 1.2K r→in        │
+│            ┌ grepika                                      │
+│            L search x5: 200 out / 3.1K r→in              │
+│            L outline x4: 150 out / 2.8K r→in             │
+│ Files    │ 2 read / 1 edited                              │
+│            * scripts/token-reporter.py                    │
+╰──────────────────────────────────────────────────────────╯
 ```
 
 ### Per-tool token breakdown explained
 
 - **`in`** — input tokens attributed to the API call where the model invoked this tool
 - **`out`** — output tokens the model generated to call this tool (the tool_use JSON block)
-- **`result→input`** — tokens in the tool's result that got fed back as input on the next API turn (tokenized with tiktoken cl100k_base). This is where tools like WebFetch, Read, and Bash consume the most tokens
+- **`result→input`** (or **`r→in`** for MCP tools) — tokens in the tool's result that got fed back as input on the next API turn (tokenized with tiktoken cl100k_base). This is where tools like WebFetch, Read, and Bash consume the most tokens
+
+### MCP tools section
+
+MCP tool names (e.g. `mcp__chrome-devtools__take_screenshot`) are too long for inline display. They get their own **MCP** section, grouped by server name with each method on its own line:
+
+- **`┌ server-name`** — server group header
+- **`L method x3: 200 out / 3.1K r→in`** — method name, call count, and token breakdown
 
 ## Prerequisites
 
