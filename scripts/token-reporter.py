@@ -282,7 +282,7 @@ def _detect_skill(user_ctx: str, prompt: str) -> str:
 # Agent transcript parsing
 # ─────────────────────────────────────────────
 
-def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = False) -> dict:
+def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = False, start_entry_index: int = 0) -> dict:
     r = {
         "input_tokens": 0, "output_tokens": 0,
         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
@@ -326,9 +326,27 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
                 last_user_idx = idx
         if last_user_idx >= 0:
             start_index = last_user_idx + 1
+    elif start_entry_index > 0:
+        # Incremental mode: skip entries already covered by a previous report
+        start_index = min(start_entry_index, len(all_entries))
 
     # Map tool_use_id -> tool_name so we can attribute tool_result costs
     tool_use_id_map = {}  # type: dict[str, str]
+
+    # Pre-scan entries just before start_index to capture tool_use_id mappings
+    # for tool_results that appear right after the boundary
+    if start_index > 0:
+        for entry in all_entries[max(0, start_index - 10):start_index]:
+            if entry.get("type") != "assistant":
+                continue
+            msg = entry.get("message", {})
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tuid = block.get("id", "")
+                        if tuid:
+                            tool_use_id_map[tuid] = block.get("name", "unknown")
 
     for entry in all_entries[start_index:]:
         etype = entry.get("type", "")
@@ -430,6 +448,8 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
     r["files_read"] = sorted(r["files_read"])
     r["files_written"] = sorted(r["files_written"])
     r["files_edited"] = sorted(r["files_edited"])
+    # Total entry count so callers can save a watermark for incremental parsing
+    r["_total_entries"] = len(all_entries)
     return r
 
 
@@ -686,6 +706,31 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
 
 
 # ─────────────────────────────────────────────
+# Watermark — incremental reporting
+# ─────────────────────────────────────────────
+
+def _watermark_path(report_dir: Path, transcript_path: str) -> Path:
+    """Path to marker file tracking last-reported entry index for a transcript."""
+    import hashlib
+    key = hashlib.md5(transcript_path.encode()).hexdigest()[:12]
+    return report_dir / f"watermark-{key}.txt"
+
+
+def _read_watermark(report_dir: Path, transcript_path: str) -> int:
+    """Read the last-reported entry index, or 0 if no prior report."""
+    try:
+        return int(_watermark_path(report_dir, transcript_path).read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_watermark(report_dir: Path, transcript_path: str, index: int):
+    """Save the entry index so the next report starts from here."""
+    report_dir.mkdir(parents=True, exist_ok=True)
+    _watermark_path(report_dir, transcript_path).write_text(str(index))
+
+
+# ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 
@@ -726,12 +771,18 @@ def main():
     if not identity.get("subagent_type") and agent_type:
         identity["subagent_type"] = agent_type
 
+    # Temp dir for subagent reports and watermarks (needed before parsing)
+    report_dir = Path(tempfile.gettempdir()) / "token-reporter" / session_id[:16]
+
     # Step 2: Token usage from agent's own transcript
     # For Stop events, the hook fires before the current response is written to
     # the JSONL file. We retry with backoff until new assistant messages appear.
+    # For subagent events, use watermark-based incremental reporting so each
+    # report covers only entries since the previous report for that transcript.
     usage = {}  # type: dict
     max_retries = 6 if hook_event == "Stop" else 1
     retry_delay = 1.0  # seconds between retries for Stop events
+    actual_transcript = ""  # track which transcript was parsed for watermark update
 
     for attempt in range(max_retries):
         if attempt > 0:
@@ -740,9 +791,13 @@ def main():
             retry_delay = min(retry_delay * 1.5, 5.0)  # backoff: 1s, 1.5s, 2.25s, 3.4s, 5s
 
         if agent_transcript_path and Path(agent_transcript_path).exists():
-            dbg(f"parsing agent transcript: {agent_transcript_path}")
-            usage = parse_agent_transcript(agent_transcript_path, session_id="")
+            actual_transcript = agent_transcript_path
+            # For subagent events, read watermark to skip already-reported entries
+            start_idx = _read_watermark(report_dir, agent_transcript_path) if is_subagent_event else 0
+            dbg(f"parsing agent transcript: {agent_transcript_path} start_entry_index={start_idx}")
+            usage = parse_agent_transcript(agent_transcript_path, session_id="", start_entry_index=start_idx)
         elif transcript_path:
+            actual_transcript = transcript_path
             is_stop = hook_event == "Stop"
             dbg(f"parsing session transcript: {transcript_path} last_op_only={is_stop}")
             usage = parse_agent_transcript(transcript_path, session_id=session_id, last_op_only=is_stop)
@@ -762,14 +817,16 @@ def main():
         dbg("exit: message_count=0")
         sys.exit(0)
 
+    # Update watermark so next report starts where this one ended
+    if is_subagent_event and actual_transcript:
+        total = usage.get("_total_entries", 0)
+        if total > 0:
+            _write_watermark(report_dir, actual_transcript, total)
+            dbg(f"watermark updated: {actual_transcript} -> {total}")
+
     # Step 3: Build report
     report = build_report(hook_event, hook_input, usage, identity)
     dbg(f"report built, length={len(report)}")
-
-    # SubagentStop systemMessage is not rendered to the terminal by Claude Code,
-    # so we save subagent reports to temp files. The Stop hook then collects
-    # and displays them all together with the main session report.
-    report_dir = Path(tempfile.gettempdir()) / "token-reporter" / session_id[:16]
 
     if is_subagent_event:
         # Save this subagent/teammate/task report to a temp file for later collection
