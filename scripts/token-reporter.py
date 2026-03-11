@@ -136,6 +136,19 @@ def shorten_model(model: str) -> str:
     return s
 
 
+def fmt_duration(seconds: float) -> str:
+    """Format seconds into human-readable duration."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        m = int(seconds) // 60
+        s = int(seconds) % 60
+        return f"{m}m{s}s" if s else f"{m}m"
+    h = int(seconds) // 3600
+    m = (int(seconds) % 3600) // 60
+    return f"{h}h{m}m" if m else f"{h}h"
+
+
 def trunc(text: str, max_len: int = 100) -> str:
     if not text:
         return "—"
@@ -296,6 +309,7 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
         "tools_tokens": defaultdict(lambda: {"input": 0, "output": 0, "result_tokens": 0}),
         "files_read": set(), "files_written": set(), "files_edited": set(),
         "bash_commands": [], "web_fetches": [],
+        "first_timestamp": "", "last_timestamp": "",
     }
     seen = set()
 
@@ -332,6 +346,13 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
 
     for entry in all_entries[start_index:]:
         etype = entry.get("type", "")
+
+        # Track timestamps for duration calculation
+        ts = entry.get("timestamp", "")
+        if ts:
+            if not r["first_timestamp"]:
+                r["first_timestamp"] = ts
+            r["last_timestamp"] = ts
 
         # ── Process user entries: scan tool_result blocks for content size ──
         if etype == "user":
@@ -500,11 +521,26 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     W = "\033[97m"          # bright white - model, msg count, tool names
     R = "\033[0m"           # reset
 
+    # Duration from timestamps
+    duration_str = ""
+    t0 = usage.get("first_timestamp", "")
+    t1 = usage.get("last_timestamp", "")
+    if t0 and t1 and t0 != t1:
+        from datetime import datetime
+        try:
+            dt0 = datetime.fromisoformat(t0.replace("Z", "+00:00"))
+            dt1 = datetime.fromisoformat(t1.replace("Z", "+00:00"))
+            elapsed = (dt1 - dt0).total_seconds()
+            if elapsed > 0:
+                duration_str = f" {S}|{R} {W}{fmt_duration(elapsed)}{R}"
+        except (ValueError, TypeError):
+            pass
+
     # Header: static text same as border, dynamic values bright
     # For SubagentStop, show the agent type (e.g. "Subagent Explore a2c30deb")
     sub_type = identity.get("subagent_type", "") if is_sub else ""
     type_part = f" {W}{sub_type}{R}" if sub_type else ""
-    rows.append(f"{S}{label}{R}{type_part} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}")
+    rows.append(f"{S}{label}{R}{type_part} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}{duration_str}")
 
     # Primary tokens (bright yellow values, static labels)
     primary_input = inp + cw
@@ -519,8 +555,15 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     if cr > 0:
         rows.append(("", f"{S}  L cache-read (excluded):{R} {Y}{fmt_tok(cr)}{R}"))
 
-    # Cost (bright cyan value, static label)
-    rows.append(("Cost", f"{C}${total_cost:.2f}{R} {S}(this op){R}"))
+    # Cache efficiency — how much of total input came from cache
+    total_input_all = inp + cw + cr
+    if cr > 0 and total_input_all > 0:
+        cache_pct = (cr / total_input_all) * 100
+        rows.append(("", f"{S}  L cache efficiency:{R} {Y}{cache_pct:.0f}%{R} {S}of input from cache{R}"))
+
+    # Cost — label reflects scope: "(lifetime)" for completed agents, "(this op)" for session
+    cost_scope = "(lifetime)" if is_sub else "(this op)"
+    rows.append(("Cost", f"{C}${total_cost:.2f}{R} {S}{cost_scope}{R}"))
 
     # Per-model breakdown (only if multiple real models)
     if len(real_models) > 1:
@@ -573,6 +616,25 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
             detail_str = f"{S}:{R} {detail}" if detail else ""
             rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{detail_str}"))
 
+    # Total result→input across all tools — how much tools fed back as input
+    total_result_in = sum(tt.get("result_tokens", 0) for tt in tools_tokens.values())
+    if total_result_in > 0:
+        rows.append(("", f"{S}  L total result→input:{R} {Y}{fmt_tok(total_result_in)}{R}"))
+
+    # Bash commands executed
+    bash_cmds = usage.get("bash_commands", [])
+    if bash_cmds:
+        rows.append(("Bash", f"{W}{len(bash_cmds)}{R} {S}commands{R}"))
+        for cmd in bash_cmds:
+            rows.append(("", f"  {S}${R} {W}{cmd}{R}"))
+
+    # Web fetches
+    web_fetches = usage.get("web_fetches", [])
+    if web_fetches:
+        rows.append(("Web", f"{W}{len(web_fetches)}{R} {S}fetches{R}"))
+        for url in web_fetches:
+            rows.append(("", f"  {S}→{R} {W}{url}{R}"))
+
     # Files summary (counts bright, labels static)
     file_parts = []
     if fr: file_parts.append(f"{W}{len(fr)}{R} {S}read{R}")
@@ -593,11 +655,11 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     for f in fr:
         rows.append(("", f"  {S}·{R} {W}{f}{R}"))
 
-    # Subagent task
+    # Subagent task description — no truncation
     if is_sub:
         task = identity.get("task_description", "")
         if task:
-            rows.append(("Task", trunc(task, 60)))
+            rows.append(("Task", f"{W}{task}{R}"))
 
     # ── Render unicode table ──
     # Emoji and CJK characters are 2 columns wide in terminals, but len() counts
