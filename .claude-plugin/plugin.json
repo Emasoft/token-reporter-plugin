@@ -1,5 +1,23 @@
 {
   "name": "token-reporter",
-  "description": "Reports per-agent token usage, identity, cost estimates, and activity tracking as a markdown table when agents/subagents complete.",
-  "version": "1.0.0"
+  "version": "1.1.0",
+  "description": "Per-operation token usage reporter for Claude Code. Shows token counts, cost estimates, tool attribution, cache efficiency, duration, bash commands, web fetches, and file activity when agents complete. Only outputs in debug mode (claude --debug).",
+  "author": {
+    "name": "Emasoft",
+    "email": "713559+Emasoft@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/Emasoft/token-reporter-plugin",
+  "repository": "https://github.com/Emasoft/token-reporter-plugin",
+  "license": "MIT",
+  "keywords": [
+    "tokens",
+    "usage",
+    "cost",
+    "reporter",
+    "hooks",
+    "debug",
+    "cache",
+    "attribution",
+    "monitoring"
+  ]
 }
