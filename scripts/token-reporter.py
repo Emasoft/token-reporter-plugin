@@ -40,10 +40,45 @@ Configure in .claude/settings.json (merge with existing hooks):
 import json
 import sys
 import re
+import os
 import time
 import tempfile
+import subprocess
 from pathlib import Path
 from collections import defaultdict, Counter
+
+
+# ─────────────────────────────────────────────
+# Debug mode detection — walk process tree
+# ─────────────────────────────────────────────
+
+def _is_debug_mode() -> bool:
+    """Check if Claude Code is running with --debug by walking the process tree.
+    Matches only the actual 'claude' binary (not paths containing '.claude')."""
+    pid = os.getppid()
+    while pid > 1:
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "args=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=2
+            )
+            cmdline = result.stdout.strip()
+            args = cmdline.split()
+            if args:
+                # Check the binary is actually 'claude' (not just a path with .claude)
+                cmd = os.path.basename(args[0])
+                if cmd == "claude" and "--debug" in args:
+                    return True
+            # Walk up to this process's parent
+            result = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=2
+            )
+            pid = int(result.stdout.strip())
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            break
+    return False
+
 
 # ─────────────────────────────────────────────
 # Fast tokenizer — lazy-loaded singleton
@@ -749,6 +784,12 @@ def dbg(msg: str):
 
 def main():
     dbg("hook invoked")
+
+    # Only produce output when Claude Code is running with --debug
+    if not _is_debug_mode():
+        dbg("not in debug mode, skipping")
+        sys.exit(0)
+
     try:
         hook_input = json.load(sys.stdin)
     except json.JSONDecodeError as e:
