@@ -52,6 +52,7 @@ from collections import defaultdict, Counter
 # Debug mode detection — walk process tree
 # ─────────────────────────────────────────────
 
+
 def _is_debug_mode() -> bool:
     """Check if Claude Code is running with --debug by walking the process tree.
     Matches only the actual 'claude' binary (not paths containing '.claude')."""
@@ -60,7 +61,9 @@ def _is_debug_mode() -> bool:
         try:
             result = subprocess.run(
                 ["ps", "-o", "args=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=2
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
             cmdline = result.stdout.strip()
             args = cmdline.split()
@@ -72,7 +75,9 @@ def _is_debug_mode() -> bool:
             # Walk up to this process's parent
             result = subprocess.run(
                 ["ps", "-o", "ppid=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=2
+                capture_output=True,
+                text=True,
+                timeout=2,
             )
             pid = int(result.stdout.strip())
         except (subprocess.TimeoutExpired, ValueError, OSError):
@@ -95,10 +100,14 @@ def count_tokens(text: str) -> int:
         _tokenizer_loaded = True
         try:
             import tiktoken
+
             _tokenizer = tiktoken.get_encoding("cl100k_base")
         except ImportError:
             _tokenizer = None
-            print("[token-reporter] WARNING: tiktoken not found — token counts will be approximate. Run via 'uv run --with tiktoken' to get exact counts.", file=sys.stderr)
+            print(
+                "[token-reporter] WARNING: tiktoken not found — token counts will be approximate. Run via 'uv run --with tiktoken' to get exact counts.",
+                file=sys.stderr,
+            )
     if _tokenizer is not None:
         # encode_ordinary skips special token handling — ~30% faster than encode
         return len(_tokenizer.encode_ordinary(text))
@@ -109,18 +118,73 @@ def count_tokens(text: str) -> int:
 # Pricing
 # ─────────────────────────────────────────────
 MODEL_PRICING = {
-    "claude-opus-4-6":   {"input": 5.0,  "output": 25.0, "cache_write": 6.25,  "cache_read": 0.50},
-    "claude-opus-4-5":   {"input": 5.0,  "output": 25.0, "cache_write": 6.25,  "cache_read": 0.50},
-    "claude-sonnet-4-5": {"input": 3.0,  "output": 15.0, "cache_write": 3.75,  "cache_read": 0.30},
-    "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0, "cache_write": 3.75,  "cache_read": 0.30},
-    "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0,  "cache_write": 1.25,  "cache_read": 0.10},
-    "claude-sonnet-4":   {"input": 3.0,  "output": 15.0, "cache_write": 3.75,  "cache_read": 0.30},
-    "claude-opus-4":     {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
-    "claude-opus-4-1":   {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
-    "claude-haiku-3-5":  {"input": 0.80, "output": 4.0,  "cache_write": 1.00,  "cache_read": 0.08},
-    "claude-haiku-3":    {"input": 0.25, "output": 1.25, "cache_write": 0.30,  "cache_read": 0.03},
+    "claude-opus-4-6": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_write": 6.25,
+        "cache_read": 0.50,
+    },
+    "claude-opus-4-5": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_write": 6.25,
+        "cache_read": 0.50,
+    },
+    "claude-sonnet-4-5": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_write": 3.75,
+        "cache_read": 0.30,
+    },
+    "claude-sonnet-4-6": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_write": 3.75,
+        "cache_read": 0.30,
+    },
+    "claude-haiku-4-5": {
+        "input": 1.0,
+        "output": 5.0,
+        "cache_write": 1.25,
+        "cache_read": 0.10,
+    },
+    "claude-sonnet-4": {
+        "input": 3.0,
+        "output": 15.0,
+        "cache_write": 3.75,
+        "cache_read": 0.30,
+    },
+    "claude-opus-4": {
+        "input": 15.0,
+        "output": 75.0,
+        "cache_write": 18.75,
+        "cache_read": 1.50,
+    },
+    "claude-opus-4-1": {
+        "input": 15.0,
+        "output": 75.0,
+        "cache_write": 18.75,
+        "cache_read": 1.50,
+    },
+    "claude-haiku-3-5": {
+        "input": 0.80,
+        "output": 4.0,
+        "cache_write": 1.00,
+        "cache_read": 0.08,
+    },
+    "claude-haiku-3": {
+        "input": 0.25,
+        "output": 1.25,
+        "cache_write": 0.30,
+        "cache_read": 0.03,
+    },
 }
-DEFAULT_PRICING = {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30}
+DEFAULT_PRICING = {
+    "input": 3.0,
+    "output": 15.0,
+    "cache_write": 3.75,
+    "cache_read": 0.30,
+}
 
 
 def get_pricing(model_name: str) -> dict:
@@ -166,8 +230,8 @@ def fmt_tok(n: int) -> str:
 def shorten_model(model: str) -> str:
     if not model:
         return "unknown"
-    s = re.sub(r'-\d{8}$', '', model)
-    s = re.sub(r'^claude-', '', s)
+    s = re.sub(r"-\d{8}$", "", model)
+    s = re.sub(r"^claude-", "", s)
     return s
 
 
@@ -188,12 +252,13 @@ def trunc(text: str, max_len: int = 100) -> str:
     if not text:
         return "—"
     text = text.replace("\n", " ").replace("|", "\\|").strip()
-    return text if len(text) <= max_len else text[:max_len - 1] + "…"
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
 
 
 # ─────────────────────────────────────────────
 # JSONL helpers
 # ─────────────────────────────────────────────
+
 
 def parse_jsonl(filepath: str):
     try:
@@ -212,6 +277,7 @@ def parse_jsonl(filepath: str):
 # ─────────────────────────────────────────────
 # Identity extraction from parent transcript
 # ─────────────────────────────────────────────
+
 
 def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
     identity = {
@@ -239,7 +305,8 @@ def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
                     last_user_ctx = c
                 elif isinstance(c, list):
                     last_user_ctx = " ".join(
-                        b.get("text", "") for b in c
+                        b.get("text", "")
+                        for b in c
                         if isinstance(b, dict) and b.get("type") == "text"
                     )
 
@@ -271,7 +338,9 @@ def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
                 identity["subagent_type"] = ti.get("subagent_type", "")
                 identity["requested_model"] = ti.get("model", "")
                 identity["run_in_background"] = ti.get("run_in_background", False)
-                identity["spawning_skill"] = _detect_skill(last_user_ctx, ti.get("prompt", ""))
+                identity["spawning_skill"] = _detect_skill(
+                    last_user_ctx, ti.get("prompt", "")
+                )
 
             if matched:
                 return identity
@@ -303,23 +372,45 @@ def _match_task(entries, start, tool_use_id, agent_id):
 
 def _detect_skill(user_ctx: str, prompt: str) -> str:
     combined = (user_ctx + " " + prompt).lower()
-    skip = {"compact", "clear", "hooks", "model", "cost", "context", "resume",
-            "help", "config", "plan", "build", "review", "status", "memory",
-            "path", "tmp", "home", "usr", "etc", "var", "bin", "dev", "mnt"}
+    skip = {
+        "compact",
+        "clear",
+        "hooks",
+        "model",
+        "cost",
+        "context",
+        "resume",
+        "help",
+        "config",
+        "plan",
+        "build",
+        "review",
+        "status",
+        "memory",
+        "path",
+        "tmp",
+        "home",
+        "usr",
+        "etc",
+        "var",
+        "bin",
+        "dev",
+        "mnt",
+    }
 
-    for pat in re.findall(r'/([a-z][a-z0-9_-]+)', combined):
+    for pat in re.findall(r"/([a-z][a-z0-9_-]+)", combined):
         if pat not in skip and len(pat) > 2:
             return f"/{pat}"
 
-    m = re.search(r'(?:using skill|skill[:\s]+)([a-z][a-z0-9_-]+)', combined)
+    m = re.search(r"(?:using skill|skill[:\s]+)([a-z][a-z0-9_-]+)", combined)
     if m:
         return f"skill:{m.group(1)}"
 
-    m = re.search(r'\.claude/agents/([a-z][a-z0-9_-]+)\.md', combined)
+    m = re.search(r"\.claude/agents/([a-z][a-z0-9_-]+)\.md", combined)
     if m:
         return f"agent:{m.group(1)}"
 
-    m = re.search(r'\.claude/skills/([a-z][a-z0-9_-]+)', combined)
+    m = re.search(r"\.claude/skills/([a-z][a-z0-9_-]+)", combined)
     if m:
         return f"skill:{m.group(1)}"
 
@@ -330,21 +421,36 @@ def _detect_skill(user_ctx: str, prompt: str) -> str:
 # Agent transcript parsing
 # ─────────────────────────────────────────────
 
-def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = False) -> dict:
+
+def parse_agent_transcript(
+    path: str, session_id: str, last_op_only: bool = False
+) -> dict:
     r = {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
         "message_count": 0,
-        "models_used": defaultdict(lambda: {
-            "input_tokens": 0, "output_tokens": 0,
-            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
-            "message_count": 0,
-        }),
+        "models_used": defaultdict(
+            lambda: {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "message_count": 0,
+            }
+        ),
         "tools_used": Counter(),
-        "tools_tokens": defaultdict(lambda: {"input": 0, "output": 0, "result_tokens": 0}),
-        "files_read": set(), "files_written": set(), "files_edited": set(),
-        "bash_commands": [], "web_fetches": [],
-        "first_timestamp": "", "last_timestamp": "",
+        "tools_tokens": defaultdict(
+            lambda: {"input": 0, "output": 0, "result_tokens": 0}
+        ),
+        "files_read": set(),
+        "files_written": set(),
+        "files_edited": set(),
+        "bash_commands": [],
+        "web_fetches": [],
+        "first_timestamp": "",
+        "last_timestamp": "",
     }
     seen = set()
 
@@ -395,7 +501,10 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
             content = msg.get("content", [])
             if isinstance(content, list):
                 for block in content:
-                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    if (
+                        not isinstance(block, dict)
+                        or block.get("type") != "tool_result"
+                    ):
                         continue
                     # Match this tool_result back to its originating tool
                     tuid = block.get("tool_use_id", "")
@@ -433,8 +542,12 @@ def parse_agent_transcript(path: str, session_id: str, last_op_only: bool = Fals
             u = msg.get("usage", {})
             if u:
                 model = msg.get("model", "unknown")
-                for f in ["input_tokens", "output_tokens",
-                           "cache_creation_input_tokens", "cache_read_input_tokens"]:
+                for f in [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                ]:
                     v = u.get(f, 0)
                     r[f] += v
                     r["models_used"][model][f] += v
@@ -512,7 +625,11 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     """Build a compact unicode-bordered report for terminal display."""
     is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
     # Show the hook event type as the label for teammate/task events
-    label_map = {"SubagentStop": "Subagent", "TeammateIdle": "Teammate", "TaskCompleted": "Task"}
+    label_map = {
+        "SubagentStop": "Subagent",
+        "TeammateIdle": "Teammate",
+        "TaskCompleted": "Task",
+    }
     label = label_map.get(hook_event, "Session")
     agent_id = hook_input.get("agent_id", hook_input.get("session_id", ""))
     short_id = agent_id[:8] if agent_id else "?"
@@ -532,8 +649,11 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
 
     # Tools — separate regular tools from MCP tools (long names break box width)
     tools = usage.get("tools_used", {})
-    all_top_tools = (tools.most_common() if hasattr(tools, 'most_common')
-                     else sorted(tools.items(), key=lambda x: -x[1]))
+    all_top_tools = (
+        tools.most_common()
+        if hasattr(tools, "most_common")
+        else sorted(tools.items(), key=lambda x: -x[1])
+    )
     regular_tools = [(t, c) for t, c in all_top_tools if not t.startswith("mcp__")]
     mcp_tools_list = [(t, c) for t, c in all_top_tools if t.startswith("mcp__")]
 
@@ -548,13 +668,13 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # ANSI color palette for dark terminals
     # Principle: ONE color for all static/non-changing text (same as border),
     # bright colors ONLY for dynamic/changing values that pop out
-    S = "\033[94m"          # static - bright blue (border, labels, all non-changing text)
-    Y = "\033[93m"          # bright yellow - ALL token values (unified)
-    C = "\033[92m"          # bright green - cost values
-    G = "\033[95m"          # bright magenta - tool counts
-    H = "\033[96m"          # bright cyan - session hash
-    W = "\033[97m"          # bright white - model, msg count, tool names
-    R = "\033[0m"           # reset
+    S = "\033[94m"  # static - bright blue (border, labels, all non-changing text)
+    Y = "\033[93m"  # bright yellow - ALL token values (unified)
+    C = "\033[92m"  # bright green - cost values
+    G = "\033[95m"  # bright magenta - tool counts
+    H = "\033[96m"  # bright cyan - session hash
+    W = "\033[97m"  # bright white - model, msg count, tool names
+    R = "\033[0m"  # reset
 
     # Duration from timestamps
     duration_str = ""
@@ -562,6 +682,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     t1 = usage.get("last_timestamp", "")
     if t0 and t1 and t0 != t1:
         from datetime import datetime
+
         try:
             dt0 = datetime.fromisoformat(t0.replace("Z", "+00:00"))
             dt1 = datetime.fromisoformat(t1.replace("Z", "+00:00"))
@@ -575,7 +696,9 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # For SubagentStop, show the agent type (e.g. "Subagent Explore a2c30deb")
     sub_type = identity.get("subagent_type", "") if is_sub else ""
     type_part = f" {W}{sub_type}{R}" if sub_type else ""
-    rows.append(f"{S}{label}{R}{type_part} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}{duration_str}")
+    rows.append(
+        f"{S}{label}{R}{type_part} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}{duration_str}"
+    )
 
     # Primary tokens (bright yellow values, static labels)
     primary_input = inp + cw
@@ -594,7 +717,12 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     total_input_all = inp + cw + cr
     if cr > 0 and total_input_all > 0:
         cache_pct = (cr / total_input_all) * 100
-        rows.append(("", f"{S}  L cache efficiency:{R} {Y}{cache_pct:.0f}%{R} {S}of input from cache{R}"))
+        rows.append(
+            (
+                "",
+                f"{S}  L cache efficiency:{R} {Y}{cache_pct:.0f}%{R} {S}of input from cache{R}",
+            )
+        )
 
     # Cost — label reflects scope: "(lifetime)" for completed agents, "(this op)" for session
     cost_scope = "(lifetime)" if is_sub else "(this op)"
@@ -604,9 +732,21 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     if len(real_models) > 1:
         for model, stats in real_models.items():
             c = estimate_cost(stats, model)
-            mt = sum(stats[f] for f in ["input_tokens", "output_tokens",
-                     "cache_creation_input_tokens", "cache_read_input_tokens"])
-            rows.append((f"{S}  L {shorten_model(model)}{R}", f"{Y}{fmt_tok(mt)}{R} {S}tokens /{R} {C}${c:.2f}{R}"))
+            mt = sum(
+                stats[f]
+                for f in [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                ]
+            )
+            rows.append(
+                (
+                    f"{S}  L {shorten_model(model)}{R}",
+                    f"{Y}{fmt_tok(mt)}{R} {S}tokens /{R} {C}${c:.2f}{R}",
+                )
+            )
 
     # Regular tools with per-tool token attribution
     tools_tokens = usage.get("tools_tokens", {})
@@ -633,7 +773,12 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # MCP tools — listed vertically (one per line) to avoid breaking box width
     if mcp_tools_list:
         total_mcp_calls = sum(c for _, c in mcp_tools_list)
-        rows.append(("MCP", f"{W}{len(mcp_tools_list)}{R} {S}tools{R} {S}/{R} {G}x{total_mcp_calls}{R} {S}calls{R}"))
+        rows.append(
+            (
+                "MCP",
+                f"{W}{len(mcp_tools_list)}{R} {S}tools{R} {S}/{R} {G}x{total_mcp_calls}{R} {S}calls{R}",
+            )
+        )
         # Each MCP tool on its own line with full name and token breakdown
         for t, c in mcp_tools_list:
             tt = tools_tokens.get(t, {})
@@ -654,7 +799,9 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
     # Total result→input across all tools — how much tools fed back as input
     total_result_in = sum(tt.get("result_tokens", 0) for tt in tools_tokens.values())
     if total_result_in > 0:
-        rows.append(("", f"{S}  L total result→input:{R} {Y}{fmt_tok(total_result_in)}{R}"))
+        rows.append(
+            ("", f"{S}  L total result→input:{R} {Y}{fmt_tok(total_result_in)}{R}")
+        )
 
     # Bash commands executed
     bash_cmds = usage.get("bash_commands", [])
@@ -672,9 +819,12 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
 
     # Files summary (counts bright, labels static)
     file_parts = []
-    if fr: file_parts.append(f"{W}{len(fr)}{R} {S}read{R}")
-    if fe: file_parts.append(f"{W}{len(fe)}{R} {S}edited{R}")
-    if fw: file_parts.append(f"{W}{len(fw)}{R} {S}written{R}")
+    if fr:
+        file_parts.append(f"{W}{len(fr)}{R} {S}read{R}")
+    if fe:
+        file_parts.append(f"{W}{len(fe)}{R} {S}edited{R}")
+    if fw:
+        file_parts.append(f"{W}{len(fw)}{R} {S}written{R}")
     if file_parts:
         rows.append(("Files", f" {S}/{R} ".join(file_parts)))
 
@@ -711,20 +861,20 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
         if 0x2500 <= cp <= 0x259F:
             return 1
         cat = unicodedata.category(c)
-        if cat.startswith('M') or cat == 'Cf':  # Mark or Format
+        if cat.startswith("M") or cat == "Cf":  # Mark or Format
             return 0
         ea = unicodedata.east_asian_width(c)
-        if ea in ('F', 'W'):  # Fullwidth or Wide
+        if ea in ("F", "W"):  # Fullwidth or Wide
             return 2
         # Most emoji not caught by east_asian_width: check Unicode category
         # Emoji modifiers, symbols, pictographs are typically 2-wide
-        if cat.startswith('So'):  # Symbol, Other (covers most emoji)
+        if cat.startswith("So"):  # Symbol, Other (covers most emoji)
             return 2
         return 1
 
     def _strip_ansi(s: str) -> str:
         """Remove ANSI escape sequences before measuring display width."""
-        return re.sub(r'\033\[[0-9;]*m', '', s)
+        return re.sub(r"\033\[[0-9;]*m", "", s)
 
     def dw(s: str) -> int:
         """Display width of a string in terminal columns."""
@@ -735,13 +885,15 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
         cur = dw(s)
         if cur >= width:
             return s
-        return s + ' ' * (width - cur)
+        return s + " " * (width - cur)
 
     header = rows[0]  # first element is the header string
     data_rows = rows[1:]  # rest are (label, value) tuples
 
     # Calculate column widths using display width
-    max_label = max((dw(r[0]) for r in data_rows if isinstance(r, tuple) and r[0]), default=12)
+    max_label = max(
+        (dw(r[0]) for r in data_rows if isinstance(r, tuple) and r[0]), default=12
+    )
     max_val = max((dw(r[1]) for r in data_rows if isinstance(r, tuple)), default=20)
     max_label = max(max_label, 12)
     max_val = max(max_val, 20)
@@ -777,6 +929,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
 # Main
 # ─────────────────────────────────────────────
 
+
 def dbg(msg: str):
     """Debug log to stderr — visible in ~/.claude/debug/ when debug mode is on."""
     print(f"[token-reporter] {msg}", file=sys.stderr)
@@ -796,7 +949,9 @@ def main():
         dbg(f"JSON parse error: {e}")
         sys.exit(1)
 
-    dbg(f"hook_event={hook_input.get('hook_event_name')} session={hook_input.get('session_id','')[:8]}")
+    dbg(
+        f"hook_event={hook_input.get('hook_event_name')} session={hook_input.get('session_id', '')[:8]}"
+    )
 
     session_id = hook_input.get("session_id", "")
     transcript_path = hook_input.get("transcript_path", "")
@@ -831,9 +986,13 @@ def main():
 
     for attempt in range(max_retries):
         if attempt > 0:
-            dbg(f"retry {attempt}/{max_retries-1}, waiting {retry_delay}s for transcript flush...")
+            dbg(
+                f"retry {attempt}/{max_retries - 1}, waiting {retry_delay}s for transcript flush..."
+            )
             time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 1.5, 5.0)  # backoff: 1s, 1.5s, 2.25s, 3.4s, 5s
+            retry_delay = min(
+                retry_delay * 1.5, 5.0
+            )  # backoff: 1s, 1.5s, 2.25s, 3.4s, 5s
 
         if agent_transcript_path and Path(agent_transcript_path).exists():
             # Full lifetime parse — report everything this agent did from start to finish
@@ -842,7 +1001,9 @@ def main():
         elif transcript_path:
             is_stop = hook_event == "Stop"
             dbg(f"parsing session transcript: {transcript_path} last_op_only={is_stop}")
-            usage = parse_agent_transcript(transcript_path, session_id=session_id, last_op_only=is_stop)
+            usage = parse_agent_transcript(
+                transcript_path, session_id=session_id, last_op_only=is_stop
+            )
         else:
             dbg("exit: no transcript path found")
             sys.exit(0)
@@ -851,7 +1012,9 @@ def main():
             break  # found messages, proceed
         dbg(f"attempt {attempt}: message_count=0")
 
-    dbg(f"messages={usage['message_count']} inp={usage['input_tokens']} out={usage['output_tokens']} cw={usage['cache_creation_input_tokens']} cr={usage['cache_read_input_tokens']}")
+    dbg(
+        f"messages={usage['message_count']} inp={usage['input_tokens']} out={usage['output_tokens']} cw={usage['cache_creation_input_tokens']} cr={usage['cache_read_input_tokens']}"
+    )
     dbg(f"tools={dict(usage.get('tools_used', {}))}")
     dbg(f"tools_tokens={dict(usage.get('tools_tokens', {}))}")
 
@@ -870,7 +1033,7 @@ def main():
         # Save this subagent/teammate/task report to a temp file for later collection
         report_dir.mkdir(parents=True, exist_ok=True)
         aid = agent_id[:8] if agent_id else "unknown"
-        report_file = report_dir / f"subagent-{aid}-{int(time.time()*1000)}.txt"
+        report_file = report_dir / f"subagent-{aid}-{int(time.time() * 1000)}.txt"
         report_file.write_text(report, encoding="utf-8")
         dbg(f"saved subagent report to {report_file}")
         # Still return systemMessage (it becomes a system context message for the AI)
