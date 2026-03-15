@@ -91,24 +91,44 @@ Install uv if you don't have it:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+## Naming
+
+- **Plugin name**: `token-reporter` — this is the name in `plugin.json` and what you use with `claude plugin install`
+- **GitHub repo**: [`Emasoft/token-reporter-plugin`](https://github.com/Emasoft/token-reporter-plugin) — where the source code lives
+
+The plugin name and repo name are intentionally different. When installing or referencing the plugin, always use `token-reporter` (the plugin name), not `token-reporter-plugin` (the repo name).
+
 ## Installation
 
 ### From the emasoft-plugins marketplace (recommended)
 
-Add the marketplace to `~/.claude/settings.json` if you haven't already:
+```bash
+claude plugin install token-reporter@emasoft-plugins
+```
+
+If you haven't added the marketplace yet:
+
+```bash
+claude plugin marketplace add Emasoft/emasoft-plugins
+```
+
+Then install:
+
+```bash
+claude plugin install token-reporter@emasoft-plugins
+```
+
+Restart Claude Code to activate.
+
+### Alternative: manual settings.json
+
+Add the marketplace and enable the plugin in `~/.claude/settings.json`:
 
 ```json
 {
   "pluginMarketplaces": [
     "Emasoft/emasoft-plugins"
-  ]
-}
-```
-
-Then enable the plugin:
-
-```json
-{
+  ],
   "enabledPlugins": {
     "token-reporter@emasoft-plugins": true
   }
@@ -120,12 +140,18 @@ Restart Claude Code or run `/reload-plugins` to activate.
 ### Manual installation (development)
 
 ```bash
-# Clone the repo
-git clone https://github.com/Emasoft/emasoft-plugins.git /tmp/emasoft-plugins
+# Clone the plugin repo directly
+git clone https://github.com/Emasoft/token-reporter-plugin.git /tmp/token-reporter-plugin
 
-# Copy the plugin to a local marketplace
+# Install from local path
+claude plugin install /tmp/token-reporter-plugin/token-reporter
+```
+
+Or copy to a local marketplace:
+
+```bash
 mkdir -p ~/.claude/plugins/marketplaces/local-marketplace/plugins/
-cp -r /tmp/emasoft-plugins/plugins/token-reporter ~/.claude/plugins/marketplaces/local-marketplace/plugins/token-reporter
+cp -r /tmp/token-reporter-plugin/token-reporter ~/.claude/plugins/marketplaces/local-marketplace/plugins/token-reporter
 ```
 
 Then enable in `~/.claude/settings.json`:
@@ -138,7 +164,7 @@ Then enable in `~/.claude/settings.json`:
 }
 ```
 
-Restart Claude Code or run `/reload-plugins` to activate.
+Restart Claude Code to activate.
 
 ### Plugin directory structure
 
