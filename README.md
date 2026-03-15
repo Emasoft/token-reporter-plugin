@@ -1,48 +1,70 @@
 # token-reporter
 
-A Claude Code plugin that displays per-operation token usage when agents and subagents complete.
+A Claude Code plugin that displays per-operation token usage when agents and subagents complete. **Only outputs in debug mode** (`claude --debug`).
 
 ## What it reports
 
-After each Claude Code response, a compact unicode-bordered report appears in the terminal showing:
+After each Claude Code response (in debug mode), a compact unicode-bordered report appears in the terminal showing:
 
 - **Token counts** — fresh input + cache-write (what counts toward rate limits) and output
 - **Cache breakdown** — cache-write (included in limits) and cache-read (excluded) shown separately
+- **Cache efficiency** — percentage of total input that came from cache
+- **Duration** — elapsed time from first to last message in the operation
 - **Per-tool attribution** — input, output, and result tokens for each tool used
-- **Cost estimate** — based on published Anthropic API pricing
-- **Agent identity** — agent type/name, model, message count
-- **Files touched** — read, edited, written
+- **Cost estimate** — based on published Anthropic API pricing, scoped to lifetime (agents) or current operation (session)
+- **Agent identity** — agent type/name, model, message count, duration
+- **Bash commands** — every shell command executed, listed individually
+- **Web fetches** — every URL fetched, listed individually
+- **Files touched** — read, edited, and written files all listed individually
 
 ```
-╭──────────────────────────────────────────────────────────╮
-│ Subagent Explore ae3d16d9 | haiku-4-5 | 3 messages       │
-├──────────────────────────────────────────────────────────┤
-│ Tokens   │ 34.8K input / 573 output                      │
-│            L cache-write (included): 2.1K                 │
-│            L cache-read (excluded): 12.4K                 │
-│ Cost     │ $0.04 (this op)                                │
-│ Tools    │ WebFetch x1 / Bash x2                          │
-│            L WebFetch x1: 144 out / 85.2K result→input    │
-│            L Bash x2: 429 out / 312 result→input          │
-╰──────────────────────────────────────────────────────────╯
-╭──────────────────────────────────────────────────────────╮
-│ Session 2779c422 | opus-4-6 | 15 messages                │
-├──────────────────────────────────────────────────────────┤
-│ Tokens   │ 367.5K input / 1.1K output                    │
-│            L cache-write (included): 54.8K                │
-│            L cache-read (excluded): 528.5K                │
-│ Cost     │ $2.59 (this op)                                │
-│ Tools    │ Bash x12 / Edit x3 / Read x2                  │
-│            L Bash x12: 2.0K out / 1.4K result→input      │
-│            L Edit x3: 890 out / 245 result→input         │
-│            L Read x2: 251 out / 6.3K result→input        │
-│ MCP      │ 3 tools / x10 calls                                             │
-│            L mcp__chrome-devtools__take_screenshot x3: 2.1K result→input    │
-│            L mcp__chrome-devtools__navigate_page x2: 89 out / 1.2K r→input  │
-│            L mcp__grepika__search x5: 200 out / 3.1K result→input           │
-│ Files    │ 2 read / 1 edited                              │
-│            * scripts/token-reporter.py                    │
-╰──────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────╮
+│ Subagent Explore ae3d16d9 | haiku-4-5 | 3 messages | 12s     │
+├──────────────────────────────────────────────────────────────┤
+│ Tokens   │ 34.8K input / 573 output                          │
+│            L cache-write (included): 2.1K                     │
+│            L cache-read (excluded): 12.4K                     │
+│            L cache efficiency: 36% of input from cache        │
+│ Cost     │ $0.04 (lifetime)                                   │
+│ Tools    │ WebFetch x1 / Bash x2                              │
+│            L WebFetch x1: 144 out / 85.2K result→input        │
+│            L Bash x2: 429 out / 312 result→input              │
+│ Bash     │ 2 commands                                         │
+│            $ git status                                       │
+│            $ ls -la src/                                      │
+│ Files    │ 3 read                                             │
+│            · README.md                                        │
+│            · src/index.ts                                     │
+│            · package.json                                     │
+╰──────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Session 2779c422 | opus-4-6 | 15 messages | 2m34s                            │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Tokens   │ 367.5K input / 1.1K output                                        │
+│            L cache-write (included): 54.8K                                    │
+│            L cache-read (excluded): 528.5K                                    │
+│            L cache efficiency: 56% of input from cache                        │
+│ Cost     │ $2.59 (this op)                                                    │
+│ Tools    │ Bash x12 / Edit x3 / Read x2                                      │
+│            L Bash x12: 2.0K out / 1.4K result→input                          │
+│            L Edit x3: 890 out / 245 result→input                             │
+│            L Read x2: 251 out / 6.3K result→input                            │
+│ MCP      │ 3 tools / x10 calls                                               │
+│            L mcp__chrome-devtools__take_screenshot x3: 2.1K result→input      │
+│            L mcp__chrome-devtools__navigate_page x2: 89 out / 1.2K r→input    │
+│            L mcp__grepika__search x5: 200 out / 3.1K result→input             │
+│            L total result→input: 97.1K                                        │
+│ Bash     │ 12 commands                                                        │
+│            $ git status                                                       │
+│            $ npm test                                                         │
+│            $ ...                                                              │
+│ Web      │ 1 fetches                                                          │
+│            → https://api.github.com/repos/...                                 │
+│ Files    │ 2 read / 1 edited                                                  │
+│            · README.md                                                        │
+│            · src/index.ts                                                     │
+│            * scripts/token-reporter.py                                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ### Per-tool token breakdown explained
@@ -123,33 +145,43 @@ Restart Claude Code or run `/reload-plugins` to activate.
 ```
 token-reporter/
   .claude-plugin/
-    plugin.json          # Plugin manifest
+    plugin.json            # Plugin manifest
+  .github/
+    workflows/
+      notify-marketplace.yml  # Auto-notify emasoft-plugins on version bump
   hooks/
-    hooks.json           # Hook event → command mapping
+    hooks.json             # Hook event → command mapping
   scripts/
-    token-reporter.py    # Main hook script
+    token-reporter.py      # Main hook script
+    bump_version.py        # Semver bumper for plugin.json
+    publish.py             # Full release pipeline (lint, bump, tag, push, gh release)
+    pre-push               # Git pre-push quality gate hook
 ```
 
 ### 4. Verify
 
-Run any command in Claude Code. When the response completes, you should see the token report box in the terminal. Enable debug mode to see detailed logs:
+The plugin **only outputs reports in debug mode**. Start Claude Code with:
 
 ```bash
 claude --debug
 ```
 
-Look for lines prefixed with `[token-reporter]` in stderr output (visible in `~/.claude/debug/`).
+Run any command. When the response completes, you should see the token report box in the terminal. Look for lines prefixed with `[token-reporter]` in stderr output (visible in `~/.claude/debug/`).
+
+Without `--debug`, the hook exits immediately with no output.
 
 ## How it works
 
 The plugin registers four hook events in `hooks/hooks.json`:
 
-| Hook Event | When it fires | What the script does |
-|---|---|---|
-| **Stop** | Main session response complete | Parses session transcript (since last user prompt), collects any saved subagent reports, displays all together |
-| **SubagentStop** | Subagent (Explore, Plan, etc.) finished | Parses agent's transcript, saves report to `/tmp/token-reporter/{session}/` |
-| **TeammateIdle** | Teammate agent paused/waiting | Same as SubagentStop |
-| **TaskCompleted** | Background task finished | Same as SubagentStop |
+| Hook Event | When it fires | What the script does | Cost label |
+|---|---|---|---|
+| **Stop** | Main session response complete | Parses session transcript (since last user prompt), collects any saved subagent reports, displays all together | `(this op)` |
+| **SubagentStop** | Subagent (Explore, Plan, etc.) finished | Parses agent's full lifetime transcript | `(lifetime)` |
+| **TeammateIdle** | Teammate agent paused/waiting | Same as SubagentStop | `(lifetime)` |
+| **TaskCompleted** | Background task finished | Same as SubagentStop | `(lifetime)` |
+
+**Debug gate**: The hook first walks the process tree (`getppid()` → `ps -o args=`) checking for a parent `claude` process with `--debug` flag. If not found, the hook exits immediately with no output or processing.
 
 **Why the temp file pattern?** Claude Code only renders `systemMessage` output to the terminal for Stop events. SubagentStop/TeammateIdle/TaskCompleted output is consumed as system context but not displayed. So the script saves child agent reports to temp files, and the Stop hook collects and displays them all together.
 
@@ -198,7 +230,13 @@ Unknown models default to Sonnet pricing.
 
 ## Debug mode
 
-Enable Claude Code debug mode to see detailed stderr logs:
+The plugin **requires** debug mode to produce any output. Start Claude Code with:
+
+```bash
+claude --debug
+```
+
+Detailed stderr logs (visible in `~/.claude/debug/`):
 
 ```
 [token-reporter] hook invoked
@@ -210,6 +248,29 @@ Enable Claude Code debug mode to see detailed stderr logs:
 [token-reporter] tools_tokens={'Bash': {'input': ..., 'output': ..., 'result_tokens': ...}, ...}
 [token-reporter] collected 1 subagent reports
 [token-reporter] report built, length=1234
+```
+
+Without `--debug`, the hook detects the absence via process tree inspection and exits immediately (no transcript parsing, no output).
+
+## Publishing
+
+```bash
+# Bump patch version, tag, push, create GitHub release
+uv run scripts/publish.py
+
+# Or specify bump level
+uv run scripts/publish.py --minor
+uv run scripts/publish.py --major
+uv run scripts/publish.py --set 2.0.0
+
+# Preview without changes
+uv run scripts/publish.py --dry-run
+```
+
+The pre-push hook runs ruff lint and syntax checks before allowing pushes to main. Install it with:
+
+```bash
+ln -sf ../../scripts/pre-push .git/hooks/pre-push
 ```
 
 ## Color scheme
@@ -224,6 +285,11 @@ Designed for dark terminal backgrounds:
 | Bright magenta | Tool counts |
 | Bright cyan | Session/agent hash |
 | Bright white | Model names, tool names, file names |
+
+## Links
+
+- **Marketplace**: [Emasoft/emasoft-plugins](https://github.com/Emasoft/emasoft-plugins)
+- **Repository**: [Emasoft/token-reporter-plugin](https://github.com/Emasoft/token-reporter-plugin)
 
 ## License
 
