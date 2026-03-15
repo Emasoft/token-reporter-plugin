@@ -22,13 +22,19 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: '.claude-plugin/plugin.json'
+
       - name: Get plugin info
         id: plugin
         env:
-          REPO_NAME: ${{ github.event.repository.name }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          echo "name=${REPO_NAME}" >> "$GITHUB_OUTPUT"
+          # Read the actual plugin name from plugin.json (may differ from repo name)
+          PLUGIN_NAME=$(python3 -c "import json; print(json.load(open('.claude-plugin/plugin.json'))['name'])")
+          echo "name=${PLUGIN_NAME}" >> "$GITHUB_OUTPUT"
           echo "ref=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Trigger marketplace update
