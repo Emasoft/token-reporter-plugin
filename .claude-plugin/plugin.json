@@ -1,6 +1,6 @@
 {
   "name": "token-reporter",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Per-operation token usage reporter for Claude Code. Shows token counts, cost estimates, tool attribution, cache efficiency, duration, bash commands, web fetches, and file activity when agents complete. Only outputs in debug mode (claude --debug).",
   "author": {
     "name": "Emasoft",
