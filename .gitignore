@@ -25,3 +25,16 @@ logs/
 # Environment
 .env
 .env.*
+# TLDR artifacts (added by rechecker)
+.tldr/
+.tldrignore
+.tldr_session_*
+
+# Claude Code worktrees
+.claude/
+
+# Rechecker artifacts
+.rechecker/
+
+# LLM Externalizer output
+llm_externalizer_output/
