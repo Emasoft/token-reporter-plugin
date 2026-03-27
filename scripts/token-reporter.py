@@ -255,9 +255,115 @@ def trunc(text: str, max_len: int = 100) -> str:
     return text if len(text) <= max_len else text[: max_len - 1] + "…"
 
 
+def shorten_mcp_tool(name: str) -> str:
+    """Shorten MCP tool names for display.
+
+    mcp__plugin_serena_serena__find_symbol  -> serena:find_symbol
+    mcp__plugin_grepika_grepika__search     -> grepika:search
+    mcp__plugin_llm-externalizer_llm-externalizer__chat -> llm-ext:chat
+    mcp__chrome-devtools__take_screenshot   -> chrome-dt:take_screenshot
+    mcp__claude_ai_Gmail__gmail_search      -> Gmail:gmail_search
+    """
+    if not name.startswith("mcp__"):
+        return name
+    rest = name[5:]  # strip "mcp__"
+    # Split on double underscore to get [server_parts, tool_name]
+    parts = rest.split("__", 1)
+    if len(parts) == 2:
+        server_part, tool_name = parts
+    else:
+        return name  # can't parse, return as-is
+    # Extract a short server label from the server_part
+    # Patterns: "plugin_{name}_{name}" or "claude_ai_{Name}" or "{name}"
+    if server_part.startswith("plugin_"):
+        segments = server_part[7:].split("_", 1)  # strip "plugin_"
+        server_label = segments[0]
+    elif server_part.startswith("claude_ai_"):
+        server_label = server_part[10:]  # strip "claude_ai_"
+    else:
+        server_label = server_part
+    return f"{server_label}:{tool_name}"
+
+
 # ─────────────────────────────────────────────
 # JSONL helpers
 # ─────────────────────────────────────────────
+
+
+def discover_subagent_transcripts(transcript_path: str) -> list:
+    """Find sub-agent transcripts spawned by the agent at transcript_path.
+
+    Worktree agents and orchestrators store sub-agent transcripts at:
+        {SESSION_ID}/subagents/agent-*.jsonl
+    relative to the parent transcript {SESSION_ID}.jsonl.
+    """
+    tp = Path(transcript_path)
+    subagents_dir = tp.parent / tp.stem / "subagents"
+    if not subagents_dir.is_dir():
+        return []
+    results = []
+    for f in sorted(subagents_dir.glob("agent-*.jsonl")):
+        meta_path = f.with_suffix(".meta.json")
+        meta = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+        agent_id = f.stem[6:] if f.stem.startswith("agent-") else f.stem
+        results.append({
+            "path": str(f),
+            "agent_id": agent_id,
+            "agent_type": meta.get("agentType", ""),
+            "description": meta.get("description", ""),
+        })
+    return results
+
+
+def _merge_usage(base: dict, add: dict):
+    """Merge token usage from add into base (in place)."""
+    for f in ["input_tokens", "output_tokens", "cache_creation_input_tokens",
+              "cache_read_input_tokens", "message_count"]:
+        base[f] = base.get(f, 0) + add.get(f, 0)
+    # Merge models_used
+    for model, stats in add.get("models_used", {}).items():
+        if model not in base.get("models_used", {}):
+            base.setdefault("models_used", {})[model] = {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "message_count": 0,
+            }
+        for f in ["input_tokens", "output_tokens", "cache_creation_input_tokens",
+                   "cache_read_input_tokens", "message_count"]:
+            base["models_used"][model][f] += stats.get(f, 0)
+    # Merge tools
+    for tool, count in add.get("tools_used", {}).items():
+        base.setdefault("tools_used", Counter())[tool] += count
+    for tool, tok in add.get("tools_tokens", {}).items():
+        if tool not in base.get("tools_tokens", {}):
+            base.setdefault("tools_tokens", defaultdict(
+                lambda: {"input": 0, "output": 0, "result_tokens": 0}
+            ))
+        for f in ["input", "output", "result_tokens"]:
+            base["tools_tokens"][tool][f] += tok.get(f, 0)
+    # Merge file sets
+    for f in ["files_read", "files_written", "files_edited"]:
+        existing = base.get(f, [])
+        if isinstance(existing, set):
+            existing.update(add.get(f, []))
+        else:
+            combined = set(existing) | set(add.get(f, []))
+            base[f] = sorted(combined)
+    # Merge lists
+    base.setdefault("bash_commands", []).extend(add.get("bash_commands", []))
+    base.setdefault("web_fetches", []).extend(add.get("web_fetches", []))
+    # Timestamps: widen the range
+    t0_add = add.get("first_timestamp", "")
+    t1_add = add.get("last_timestamp", "")
+    if t0_add and (not base.get("first_timestamp") or t0_add < base["first_timestamp"]):
+        base["first_timestamp"] = t0_add
+    if t1_add and (not base.get("last_timestamp") or t1_add > base["last_timestamp"]):
+        base["last_timestamp"] = t1_add
 
 
 def parse_jsonl(filepath: str):
@@ -279,6 +385,56 @@ def parse_jsonl(filepath: str):
 # ─────────────────────────────────────────────
 
 
+def _build_tool_agent_map(entries: list) -> dict:
+    """Build a map of tool_use_id -> agentId from toolUseResult fields.
+
+    Scans user entries for toolUseResult.agentId which provides a direct,
+    unambiguous link between a tool_use_id and the agent it spawned.
+    Works for both async (background) and sync (foreground) agents,
+    including swarms where many agents launch in the same assistant turn.
+    """
+    # tool_use_id -> agentId
+    tuid_to_agent = {}  # type: dict[str, str]
+    for entry in entries:
+        if entry.get("type") != "user":
+            continue
+        # Primary source: toolUseResult.agentId (v2.1.76+)
+        tur = entry.get("toolUseResult")
+        if isinstance(tur, dict) and tur.get("agentId"):
+            # Link via the tool_result content block's tool_use_id
+            msg = entry.get("message", {})
+            content = msg.get("content", []) if isinstance(msg, dict) else []
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tuid = block.get("tool_use_id", "")
+                        if tuid:
+                            tuid_to_agent[tuid] = tur["agentId"]
+        # Fallback: parse "agentId: xxx" from tool_result text (v2.1.84 style)
+        else:
+            msg = entry.get("message", {})
+            content = msg.get("content", []) if isinstance(msg, dict) else []
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                        continue
+                    tuid = block.get("tool_use_id", "")
+                    rc = block.get("content", "")
+                    # Extract from text content
+                    text = ""
+                    if isinstance(rc, str):
+                        text = rc
+                    elif isinstance(rc, list):
+                        text = " ".join(
+                            b.get("text", "") if isinstance(b, dict) else str(b)
+                            for b in rc
+                        )
+                    m = re.search(r"agentId:\s*(\S+)", text)
+                    if m and tuid:
+                        tuid_to_agent[tuid] = m.group(1)
+    return tuid_to_agent
+
+
 def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
     identity = {
         "task_description": "",
@@ -292,6 +448,12 @@ def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
         return identity
 
     entries = list(parse_jsonl(transcript_path))
+
+    # Build tool_use_id -> agentId map from toolUseResult fields.
+    # This is the primary matching mechanism — works for swarms, background
+    # agents, and nested agents without relying on agentId in JSONL entries.
+    tuid_to_agent = _build_tool_agent_map(entries)
+
     last_user_ctx = ""
 
     for i, entry in enumerate(entries):
@@ -304,11 +466,15 @@ def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
                 if isinstance(c, str):
                     last_user_ctx = c
                 elif isinstance(c, list):
-                    last_user_ctx = " ".join(
-                        b.get("text", "")
-                        for b in c
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    )
+                    # Skip tool_result entries — they aren't user prompts
+                    has_text = False
+                    parts = []
+                    for b in c:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            parts.append(b.get("text", ""))
+                            has_text = True
+                    if has_text:
+                        last_user_ctx = " ".join(parts)
 
         if etype != "assistant":
             continue
@@ -322,7 +488,7 @@ def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") != "tool_use" or block.get("name") != "Task":
+            if block.get("type") != "tool_use" or block.get("name") not in ("Task", "Agent"):
                 continue
 
             ti = block.get("input", {})
@@ -330,26 +496,58 @@ def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
                 continue
 
             tool_use_id = block.get("id", "")
-            matched = _match_task(entries, i, tool_use_id, agent_id)
 
-            if matched or not identity["task_description"]:
-                identity["task_description"] = ti.get("description", "")
-                identity["task_prompt"] = ti.get("prompt", "")
-                identity["subagent_type"] = ti.get("subagent_type", "")
-                identity["requested_model"] = ti.get("model", "")
-                identity["run_in_background"] = ti.get("run_in_background", False)
-                identity["spawning_skill"] = _detect_skill(
-                    last_user_ctx, ti.get("prompt", "")
-                )
-
-            if matched:
+            # Match via toolUseResult.agentId map (primary, works for swarms)
+            mapped_agent = tuid_to_agent.get(tool_use_id, "")
+            if agent_id and mapped_agent == agent_id:
+                _fill_identity(identity, ti, last_user_ctx)
                 return identity
+
+            # Fallback: content string search (v2.1.84 compatibility)
+            if agent_id and _match_task_legacy(entries, i, tool_use_id, agent_id):
+                _fill_identity(identity, ti, last_user_ctx)
+                return identity
+
+    # No positive match. Fallback: if only one Task/Agent exists, use it.
+    # If multiple, we can't disambiguate — return empty identity.
+    task_inputs = []
+    task_contexts = []
+    for i, entry in enumerate(entries):
+        if entry.get("type") != "assistant":
+            continue
+        msg = entry.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        for block in msg.get("content", []):
+            if (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and block.get("name") in ("Task", "Agent")):
+                ti = block.get("input", {})
+                if isinstance(ti, dict):
+                    task_inputs.append(ti)
+                    task_contexts.append(last_user_ctx)
+
+    if len(task_inputs) == 1:
+        _fill_identity(identity, task_inputs[0], task_contexts[0])
 
     return identity
 
 
-def _match_task(entries, start, tool_use_id, agent_id):
-    if not agent_id or not tool_use_id:
+def _fill_identity(identity: dict, ti: dict, user_ctx: str):
+    """Populate identity dict from a Task/Agent tool input."""
+    identity["task_description"] = ti.get("description", "")
+    identity["task_prompt"] = ti.get("prompt", "")
+    identity["subagent_type"] = ti.get("subagent_type", "")
+    identity["requested_model"] = ti.get("model", "")
+    identity["run_in_background"] = ti.get("run_in_background", False)
+    identity["spawning_skill"] = _detect_skill(user_ctx, ti.get("prompt", ""))
+
+
+def _match_task_legacy(entries, start, tool_use_id, agent_id):
+    """Legacy matching: search for agent_id string in tool_result content.
+
+    Used as fallback for transcripts that predate toolUseResult.agentId.
+    """
+    if not tool_use_id or not agent_id:
         return False
     for j in range(start + 1, min(start + 50, len(entries))):
         e = entries[j]
@@ -497,6 +695,7 @@ def parse_agent_transcript(
 
         # ── Process user entries: scan tool_result blocks for content size ──
         if etype == "user":
+            matched_tuids = set()  # track which tool_use_ids we already counted
             msg = entry.get("message", {})
             content = msg.get("content", [])
             if isinstance(content, list):
@@ -511,6 +710,7 @@ def parse_agent_transcript(
                     tool_name = tool_use_id_map.get(tuid, "")
                     if not tool_name:
                         continue
+                    matched_tuids.add(tuid)
                     # Tokenize the tool result — this is what gets fed as input tokens
                     result_content = block.get("content", "")
                     if isinstance(result_content, list):
@@ -524,6 +724,27 @@ def parse_agent_transcript(
                     else:
                         text = str(result_content)
                     r["tools_tokens"][tool_name]["result_tokens"] += count_tokens(text)
+
+            # v2.1.85+: toolUseResult at entry level carries tool result data.
+            # Use sourceToolAssistantUUID to trace back to the assistant turn,
+            # and tokenize toolUseResult content if not already counted above.
+            tool_use_result = entry.get("toolUseResult")
+            if isinstance(tool_use_result, dict):
+                tuid = tool_use_result.get("tool_use_id", "")
+                if tuid and tuid not in matched_tuids:
+                    tool_name = tool_use_id_map.get(tuid, "")
+                    if tool_name:
+                        result_content = tool_use_result.get("content", "")
+                        if isinstance(result_content, list):
+                            text = " ".join(
+                                b.get("text", "") if isinstance(b, dict) else str(b)
+                                for b in result_content
+                            )
+                        elif isinstance(result_content, str):
+                            text = result_content
+                        else:
+                            text = str(result_content)
+                        r["tools_tokens"][tool_name]["result_tokens"] += count_tokens(text)
             continue
 
         # ── Process assistant entries ──
@@ -621,7 +842,8 @@ def _rel_path(filepath: str, project_dir: str) -> str:
             return filepath
 
 
-def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict) -> str:
+def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
+                  sub_usage_list: list = None) -> str:
     """Build a compact unicode-bordered report for terminal display."""
     is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
     # Show the hook event type as the label for teammate/task events
@@ -631,8 +853,18 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
         "TaskCompleted": "Task",
     }
     label = label_map.get(hook_event, "Session")
-    agent_id = hook_input.get("agent_id", hook_input.get("session_id", ""))
-    short_id = agent_id[:8] if agent_id else "?"
+    # For subagent events, display the agent_id; for Stop (main session), session_id
+    if is_sub:
+        display_id = hook_input.get("agent_id", "")
+        # v2.1.85 fallback: extract from agent_transcript_path filename
+        if not display_id:
+            atp = hook_input.get("agent_transcript_path", "")
+            stem = Path(atp).stem if atp else ""
+            if stem.startswith("agent-"):
+                display_id = stem[6:]
+    else:
+        display_id = hook_input.get("session_id", "")
+    short_id = display_id[:8] if display_id else "?"
     project_dir = hook_input.get("cwd", "")
 
     models_used = usage.get("models_used", {})
@@ -779,8 +1011,9 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
                 f"{W}{len(mcp_tools_list)}{R} {S}tools{R} {S}/{R} {G}x{total_mcp_calls}{R} {S}calls{R}",
             )
         )
-        # Each MCP tool on its own line with full name and token breakdown
+        # Each MCP tool on its own line with shortened name and token breakdown
         for t, c in mcp_tools_list:
+            short_t = shorten_mcp_tool(t)
             tt = tools_tokens.get(t, {})
             t_inp = tt.get("input", 0)
             t_out = tt.get("output", 0)
@@ -794,7 +1027,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
                 parts.append(f"{Y}{fmt_tok(result_toks)}{R} {S}result→input{R}")
             detail = f" {S}/{R} ".join(parts) if parts else ""
             detail_str = f"{S}:{R} {detail}" if detail else ""
-            rows.append(("", f"{S}  L{R} {W}{t}{R} {G}x{c}{R}{detail_str}"))
+            rows.append(("", f"{S}  L{R} {W}{short_t}{R} {G}x{c}{R}{detail_str}"))
 
     # Total result→input across all tools — how much tools fed back as input
     total_result_in = sum(tt.get("result_tokens", 0) for tt in tools_tokens.values())
@@ -846,83 +1079,321 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict)
         if task:
             rows.append(("Task", f"{W}{task}{R}"))
 
-    # ── Render unicode table ──
-    # Emoji and CJK characters are 2 columns wide in terminals, but len() counts
-    # them as 1 (or more for compound emoji like ✏️ which is 2 codepoints).
-    # We need display-width-aware padding.
+    # Sub-agent breakdown — shows tokens consumed by agents spawned by this agent
+    # (e.g., a worktree skill that launches a swarm of sub-agents)
+    if sub_usage_list:
+        n_subs = len(sub_usage_list)
+        sub_total_inp = sum(u["input_tokens"] + u["cache_creation_input_tokens"] for _, u in sub_usage_list)
+        sub_total_out = sum(u["output_tokens"] for _, u in sub_usage_list)
+        rows.append(
+            ("Sub-agents",
+             f"{W}{n_subs}{R} {S}spawned:{R} {Y}{fmt_tok(sub_total_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(sub_total_out)}{R} {S}out{R}")
+        )
+        for sa_info, sa_usage in sub_usage_list:
+            sa_type = sa_info.get("agent_type", "")
+            sa_desc = sa_info.get("description", "")
+            sa_label = sa_type or sa_desc or sa_info["agent_id"][:12]
+            sa_inp = sa_usage["input_tokens"] + sa_usage["cache_creation_input_tokens"]
+            sa_out = sa_usage["output_tokens"]
+            sa_cost = sum(estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items())
+            cost_str = f" {C}${sa_cost:.4f}{R}" if sa_cost > 0 else ""
+            rows.append(("", f"  {S}>{R} {W}{trunc(sa_label, 30)}{R} {Y}{fmt_tok(sa_inp)}{R}{S}/{R}{Y}{fmt_tok(sa_out)}{R}{cost_str}"))
 
+    return _render_box(rows)
+
+
+def build_worktree_report(
+    worktree_path: str,
+    orchestrator_usage: dict,
+    sub_usage_list: list,
+) -> str:
+    """Build a detailed worktree breakdown box showing per-agent cache dynamics.
+
+    Cache invalidation in worktrees is expensive: when an agent modifies a file,
+    loadChangedFiles() invalidates the cache, forcing all subsequent messages to
+    re-send context as cache_creation tokens (1.25x price) instead of cache_read
+    (0.1x price). Agents that share context with the parent can reuse the cache.
+    This report makes those dynamics visible.
+    """
+    # ANSI palette (same as build_report)
+    S = "\033[94m"
+    Y = "\033[93m"
+    C = "\033[92m"
+    G = "\033[95m"
+    H = "\033[96m"
+    W = "\033[97m"
+    R = "\033[0m"
+    RED = "\033[91m"
+
+    rows = []
+
+    # ── Header ──
+    n_agents = len(sub_usage_list)
+    # Compute total tokens across orchestrator + all sub-agents
+    all_usages = [orchestrator_usage] + [u for _, u in sub_usage_list]
+    total_inp = sum(u.get("input_tokens", 0) for u in all_usages)
+    total_out = sum(u.get("output_tokens", 0) for u in all_usages)
+    total_cw = sum(u.get("cache_creation_input_tokens", 0) for u in all_usages)
+    total_cr = sum(u.get("cache_read_input_tokens", 0) for u in all_usages)
+    total_msgs = sum(u.get("message_count", 0) for u in all_usages)
+    total_all_input = total_inp + total_cw + total_cr
+
+    # Compute total cost
+    total_cost = 0.0
+    for u in all_usages:
+        for m, s in u.get("models_used", {}).items():
+            total_cost += estimate_cost(s, m)
+
+    wt_label = worktree_path
+    # Shorten path if possible
+    try:
+        wt_label = "~/" + str(Path(worktree_path).relative_to(Path.home()))
+    except (ValueError, TypeError):
+        pass
+    # Trim to just the meaningful tail
+    if "/worktrees/" in wt_label:
+        wt_label = wt_label[wt_label.index("/worktrees/"):]
+    elif len(wt_label) > 50:
+        wt_label = "..." + wt_label[-47:]
+
+    rows.append(
+        f"{S}Worktree{R} {H}{wt_label}{R} {S}|{R} "
+        f"{W}{n_agents + 1}{R} {S}agents{R} {S}|{R} "
+        f"{W}{total_msgs}{R} {S}msgs{R} {S}|{R} "
+        f"{C}${total_cost:.2f}{R}"
+    )
+
+    # ── Totals ──
+    rows.append(("Tokens", f"{Y}{fmt_tok(total_inp + total_cw)}{R} {S}input{R} {S}/{R} {Y}{fmt_tok(total_out)}{R} {S}output{R}"))
+    if total_cw > 0:
+        rows.append(("", f"{S}  L cache-write:{R} {Y}{fmt_tok(total_cw)}{R} {S}(billed at 1.25x){R}"))
+    if total_cr > 0:
+        rows.append(("", f"{S}  L cache-read:{R} {Y}{fmt_tok(total_cr)}{R} {S}(billed at 0.1x){R}"))
+
+    # ── Cache efficiency overview ──
+    if total_all_input > 0:
+        cache_eff = (total_cr / total_all_input) * 100
+        # Color the efficiency: green if good (>50%), yellow if ok (20-50%), red if bad (<20%)
+        if cache_eff >= 50:
+            eff_color = C
+        elif cache_eff >= 20:
+            eff_color = Y
+        else:
+            eff_color = RED
+        rows.append(("Cache", f"{eff_color}{cache_eff:.0f}%{R} {S}of all input served from cache{R}"))
+
+        # Cache invalidation penalty: cache_write tokens that COULD have been
+        # cache_read if the cache wasn't invalidated. The cost delta is:
+        # (cache_write_price - cache_read_price) per million tokens
+        if total_cw > 0 and total_cr > 0:
+            # Estimate: if all cache_write had been cache_read instead
+            avg_cw_price = 3.75  # default sonnet cache_write $/MTok
+            avg_cr_price = 0.30  # default sonnet cache_read $/MTok
+            # Try to get actual prices from the most-used model
+            for u in all_usages:
+                for m_name in u.get("models_used", {}):
+                    p = get_pricing(m_name)
+                    avg_cw_price = p["cache_write"]
+                    avg_cr_price = p["cache_read"]
+                    break
+                break
+            penalty_cost = (total_cw / 1e6) * (avg_cw_price - avg_cr_price)
+            if penalty_cost > 0.001:
+                rows.append(("", f"{S}  L invalidation penalty:{R} {RED}${penalty_cost:.4f}{R} {S}(cache-write that could be cache-read){R}"))
+
+    # ── Orchestrator row ──
+    o = orchestrator_usage
+    o_inp = o.get("input_tokens", 0) + o.get("cache_creation_input_tokens", 0)
+    o_out = o.get("output_tokens", 0)
+    o_cw = o.get("cache_creation_input_tokens", 0)
+    o_cr = o.get("cache_read_input_tokens", 0)
+    o_all = o_inp + o_cr
+    o_eff = f" {S}cache:{R} {Y}{(o_cr / o_all * 100):.0f}%{R}" if o_all > 0 and o_cr > 0 else ""
+    o_cost = sum(estimate_cost(s, m) for m, s in o.get("models_used", {}).items())
+    rows.append(("Orchestrator",
+                 f"{Y}{fmt_tok(o_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(o_out)}{R} {S}out{R}{o_eff} {C}${o_cost:.4f}{R}"))
+
+    # ── Per-agent breakdown ──
+    if sub_usage_list:
+        rows.append(("Agents", f"{W}{n_agents}{R} {S}spawned in worktree{R}"))
+        for sa_info, sa_usage in sub_usage_list:
+            sa_type = sa_info.get("agent_type", "")
+            sa_desc = sa_info.get("description", "")
+            sa_label = sa_type or sa_desc or sa_info["agent_id"][:12]
+            sa_inp = sa_usage["input_tokens"] + sa_usage["cache_creation_input_tokens"]
+            sa_out = sa_usage["output_tokens"]
+            sa_cw = sa_usage["cache_creation_input_tokens"]
+            sa_cr = sa_usage["cache_read_input_tokens"]
+            sa_all_input = sa_inp + sa_cr
+            sa_msgs = sa_usage["message_count"]
+            sa_cost = sum(estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items())
+
+            # Cache efficiency per agent
+            cache_str = ""
+            if sa_all_input > 0:
+                sa_eff = (sa_cr / sa_all_input) * 100
+                if sa_eff >= 50:
+                    ec = C
+                elif sa_eff >= 20:
+                    ec = Y
+                else:
+                    ec = RED
+                cache_str = f" {S}cache:{R} {ec}{sa_eff:.0f}%{R}"
+                # Flag likely cache invalidation: high cache_write + low cache_read
+                if sa_cw > 0 and sa_eff < 15:
+                    cache_str += f" {RED}invalidated{R}"
+
+            rows.append(("", f"  {S}>{R} {W}{sa_label}{R} {S}({sa_msgs} msgs){R}"))
+            rows.append(("", f"    {Y}{fmt_tok(sa_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(sa_out)}{R} {S}out{R}{cache_str} {C}${sa_cost:.4f}{R}"))
+            # Show cache write/read breakdown if significant
+            if sa_cw > 0 or sa_cr > 0:
+                parts = []
+                if sa_cw > 0:
+                    parts.append(f"{RED}{fmt_tok(sa_cw)}{R} {S}written{R}")
+                if sa_cr > 0:
+                    parts.append(f"{C}{fmt_tok(sa_cr)}{R} {S}read{R}")
+                rows.append(("", f"    {S}L cache:{R} {f' {S}/{R} '.join(parts)}"))
+
+    # ── Tool usage across all worktree agents ──
+    combined_tools = Counter()
+    for u in all_usages:
+        for tool, count in u.get("tools_used", {}).items():
+            combined_tools[tool] += count
+    if combined_tools:
+        regular = [(t, c) for t, c in combined_tools.most_common() if not t.startswith("mcp__")]
+        mcp = [(t, c) for t, c in combined_tools.most_common() if t.startswith("mcp__")]
+        if regular:
+            tool_str = f" {S}/{R} ".join(f"{W}{t}{R} {G}x{c}{R}" for t, c in regular[:8])
+            rows.append(("Tools", tool_str))
+        if mcp:
+            for t, c in mcp[:5]:
+                rows.append(("", f"  {S}L{R} {W}{shorten_mcp_tool(t)}{R} {G}x{c}{R}"))
+
+    return _render_box(rows)
+
+
+def _render_box(rows: list) -> str:
+    """Render rows into a unicode-bordered box with word-wrap."""
     import unicodedata
 
+    S = "\033[94m"
+    R = "\033[0m"
+
     def _char_width(c: str) -> int:
-        """Terminal display width of a single character."""
         cp = ord(c)
-        # Box drawing (U+2500-U+257F) and block elements (U+2580-U+259F)
-        # are always 1 column wide despite being category So
         if 0x2500 <= cp <= 0x259F:
             return 1
         cat = unicodedata.category(c)
-        if cat.startswith("M") or cat == "Cf":  # Mark or Format
+        if cat.startswith("M") or cat == "Cf":
             return 0
         ea = unicodedata.east_asian_width(c)
-        if ea in ("F", "W"):  # Fullwidth or Wide
+        if ea in ("F", "W"):
             return 2
-        # Most emoji not caught by east_asian_width: check Unicode category
-        # Emoji modifiers, symbols, pictographs are typically 2-wide
-        if cat.startswith("So"):  # Symbol, Other (covers most emoji)
+        if cat.startswith("So"):
             return 2
         return 1
 
     def _strip_ansi(s: str) -> str:
-        """Remove ANSI escape sequences before measuring display width."""
         return re.sub(r"\033\[[0-9;]*m", "", s)
 
     def dw(s: str) -> int:
-        """Display width of a string in terminal columns."""
         return sum(_char_width(c) for c in _strip_ansi(s))
 
     def pad(s: str, width: int) -> str:
-        """Left-align string s to exactly `width` terminal columns."""
         cur = dw(s)
         if cur >= width:
             return s
         return s + " " * (width - cur)
 
-    header = rows[0]  # first element is the header string
-    data_rows = rows[1:]  # rest are (label, value) tuples
+    header = rows[0]
+    data_rows = rows[1:]
 
-    # Calculate column widths using display width
+    TARGET_INNER = 76
     max_label = max(
         (dw(r[0]) for r in data_rows if isinstance(r, tuple) and r[0]), default=12
     )
-    max_val = max((dw(r[1]) for r in data_rows if isinstance(r, tuple)), default=20)
     max_label = max(max_label, 12)
-    max_val = max(max_val, 20)
-    inner_w = max_label + 3 + max_val  # 3 = " │ " separator
-    inner_w = max(inner_w, dw(header))
+    val_budget = TARGET_INNER - max_label - 3
+    inner_w = max(TARGET_INNER, dw(header))
 
-    # Use S for all border and label chrome (must match S defined above)
-    # (S and R already defined above in the color palette)
+    _ansi_re = re.compile(r"\033\[[0-9;]*m")
 
-    lines = []
-    lines.append("")  # newline to avoid box top being broken by preceding text
-    lines.append(f"{S}╭{'─' * (inner_w + 2)}╮{R}")
-    lines.append(f"{S}│{R} {pad(header, inner_w)} {S}│{R}")
-    lines.append(f"{S}├{'─' * (inner_w + 2)}┤{R}")
+    def _content_indent(text: str) -> int:
+        stripped = _strip_ansi(text)
+        m_prefix = re.match(r"^(\s+\S\s)", stripped)
+        if m_prefix:
+            return dw(m_prefix.group(1))
+        return 0
+
+    def _wrap_ansi(text: str, budget: int, cont_indent: int = 0) -> list:
+        if dw(text) <= budget:
+            return [text]
+        cont_budget = budget - cont_indent
+        if cont_budget < 20:
+            cont_budget = 20
+        result_lines = []
+        current_line = ""
+        current_width = 0
+        active_codes = ""
+        line_budget = budget
+        i = 0
+        raw = text
+        while i < len(raw):
+            m = _ansi_re.match(raw, i)
+            if m:
+                code = m.group()
+                current_line += code
+                if code == "\033[0m":
+                    active_codes = ""
+                else:
+                    active_codes += code
+                i = m.end()
+                continue
+            ch = raw[i]
+            ch_w = _char_width(ch)
+            if current_width + ch_w > line_budget and current_width > 0:
+                result_lines.append(current_line + "\033[0m")
+                line_budget = cont_budget
+                current_line = (" " * cont_indent) + active_codes
+                current_width = cont_indent
+            current_line += ch
+            current_width += ch_w
+            i += 1
+        if current_line:
+            result_lines.append(current_line)
+        return result_lines if result_lines else [text]
+
+    out = []
+    out.append("")
+    out.append(f"{S}╭{'─' * (inner_w + 2)}╮{R}")
+    out.append(f"{S}│{R} {pad(header, inner_w)} {S}│{R}")
+    out.append(f"{S}├{'─' * (inner_w + 2)}┤{R}")
 
     for row in data_rows:
         if isinstance(row, tuple):
             lbl, val = row
-            if lbl:
-                line = f"{S}{pad(lbl, max_label)}{R} {S}│{R} {val}"
+            val_width = dw(val)
+            if val_width <= val_budget:
+                if lbl:
+                    line = f"{S}{pad(lbl, max_label)}{R} {S}│{R} {val}"
+                else:
+                    line = f"{pad('', max_label)}   {val}"
+                out.append(f"{S}│{R} {pad(line, inner_w)} {S}│{R}")
             else:
-                line = f"{pad('', max_label)}   {val}"
-            lines.append(f"{S}│{R} {pad(line, inner_w)} {S}│{R}")
+                ci = _content_indent(val)
+                wrapped = _wrap_ansi(val, val_budget, ci)
+                for wi, wline in enumerate(wrapped):
+                    if wi == 0 and lbl:
+                        prefix = f"{S}{pad(lbl, max_label)}{R} {S}│{R} "
+                    else:
+                        prefix = f"{pad('', max_label)}   "
+                    full = f"{prefix}{wline}"
+                    out.append(f"{S}│{R} {pad(full, inner_w)} {S}│{R}")
         else:
-            lines.append(f"{S}│{R} {pad(str(row), inner_w)} {S}│{R}")
+            out.append(f"{S}│{R} {pad(str(row), inner_w)} {S}│{R}")
 
-    lines.append(f"{S}╰{'─' * (inner_w + 2)}╯{R}")
-
-    return "\n".join(lines)
+    out.append(f"{S}╰{'─' * (inner_w + 2)}╯{R}")
+    return "\n".join(out)
 
 
 # ─────────────────────────────────────────────
@@ -956,9 +1427,17 @@ def main():
     session_id = hook_input.get("session_id", "")
     transcript_path = hook_input.get("transcript_path", "")
     hook_event = hook_input.get("hook_event_name", "unknown")
-    agent_id = hook_input.get("agent_id", "")
     agent_type = hook_input.get("agent_type", "")
     agent_transcript_path = hook_input.get("agent_transcript_path", "")
+    # v2.1.85: agentId removed from JSONL entries. Hook input may still
+    # provide agent_id; if not, extract from agent_transcript_path filename
+    # (pattern: agent-{agentId}.jsonl). Do NOT fall back to session_id —
+    # multiple agents can share a session.
+    agent_id = hook_input.get("agent_id", "")
+    if not agent_id and agent_transcript_path:
+        stem = Path(agent_transcript_path).stem  # "agent-{id}"
+        if stem.startswith("agent-"):
+            agent_id = stem[6:]
 
     if not session_id and not agent_transcript_path:
         dbg("exit: no session_id and no agent_transcript_path")
@@ -1022,9 +1501,44 @@ def main():
         dbg("exit: message_count=0")
         sys.exit(0)
 
-    # Step 3: Build report
-    report = build_report(hook_event, hook_input, usage, identity)
+    # Step 2b: Discover and aggregate sub-agent tokens.
+    # Worktree agents and orchestrators store sub-agent transcripts at
+    # {transcript_stem}/subagents/agent-*.jsonl next to the parent transcript.
+    # This captures the full cost of skills that spawn swarms in worktrees.
+    active_transcript = agent_transcript_path or transcript_path
+    sub_agents = discover_subagent_transcripts(active_transcript)
+    sub_usage_list = []  # (info_dict, usage_dict) for report breakdown
+    if sub_agents:
+        dbg(f"found {len(sub_agents)} sub-agent transcripts under {active_transcript}")
+        for sa in sub_agents:
+            sa_usage = parse_agent_transcript(sa["path"], session_id="")
+            if sa_usage["message_count"] > 0:
+                sub_usage_list.append((sa, sa_usage))
+                _merge_usage(usage, sa_usage)
+                dbg(
+                    f"  sub-agent {sa['agent_id'][:8]}: "
+                    f"inp={sa_usage['input_tokens']} out={sa_usage['output_tokens']} "
+                    f"msgs={sa_usage['message_count']}"
+                )
+        dbg(
+            f"after merge: messages={usage['message_count']} "
+            f"inp={usage['input_tokens']} out={usage['output_tokens']}"
+        )
+
+    # Step 3: Build report (pass sub_usage_list for summary in main box)
+    report = build_report(hook_event, hook_input, usage, identity, sub_usage_list)
     dbg(f"report built, length={len(report)}")
+
+    # Step 3b: Build dedicated worktree box if sub-agents were found.
+    # Box 1 (above) shows the total. Box 2 shows the detailed per-agent
+    # cache dynamics — cache invalidation, efficiency per agent, penalty cost.
+    if sub_usage_list:
+        # Orchestrator's own usage = total minus all sub-agents
+        orch_usage = parse_agent_transcript(active_transcript, session_id="")
+        wt_path = hook_input.get("cwd", active_transcript)
+        wt_report = build_worktree_report(wt_path, orch_usage, sub_usage_list)
+        report = report + "\n" + wt_report
+        dbg(f"worktree report appended, total length={len(report)}")
 
     # Temp dir for saving subagent reports (collected by Stop hook)
     report_dir = Path(tempfile.gettempdir()) / "token-reporter" / session_id[:16]
