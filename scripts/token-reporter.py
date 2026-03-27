@@ -364,6 +364,8 @@ def _merge_usage(base: dict, add: dict):
         base["first_timestamp"] = t0_add
     if t1_add and (not base.get("last_timestamp") or t1_add > base["last_timestamp"]):
         base["last_timestamp"] = t1_add
+    # Merge cache events
+    base.setdefault("cache_events", []).extend(add.get("cache_events", []))
 
 
 def parse_jsonl(filepath: str):
@@ -649,8 +651,14 @@ def parse_agent_transcript(
         "web_fetches": [],
         "first_timestamp": "",
         "last_timestamp": "",
+        "cache_events": [],  # detected invalidation/TTL expiry events
     }
     seen = set()
+    # State for cache invalidation detection
+    _prev_ts = ""        # timestamp of previous assistant message
+    _prev_cw = 0         # previous cache_creation
+    _prev_cr = 0         # previous cache_read
+    _recent_writes = []  # tool names that modify files since last assistant msg
 
     # Load all entries so we can optionally filter to last operation
     all_entries = list(parse_jsonl(path))
@@ -775,6 +783,72 @@ def parse_agent_transcript(
                 r["message_count"] += 1
                 r["models_used"][model]["message_count"] += 1
 
+                # ── Cache invalidation detection ──
+                # A spike in cache_creation with a drop in cache_read signals
+                # that the cache was invalidated and the full context had to be
+                # re-sent. Two main causes:
+                #   1. TTL expiry (>5 min idle → "hey!" effect)
+                #   2. File change (Edit/Write → loadChangedFiles() invalidates)
+                cw = u.get("cache_creation_input_tokens", 0)
+                cr = u.get("cache_read_input_tokens", 0)
+                inp = u.get("input_tokens", 0)
+                total_cache = cw + cr
+                # Detect: cache_creation dominates (>80%) AND is substantial (>50K)
+                is_spike = (
+                    cw > 50_000
+                    and total_cache > 0
+                    and (cw / total_cache) > 0.80
+                )
+                if is_spike:
+                    from datetime import datetime
+                    event = {
+                        "cache_write_tokens": cw,
+                        "cache_read_tokens": cr,
+                        "input_tokens": inp,
+                        "timestamp": ts,
+                        "message_index": r["message_count"],
+                        "preceding_tools": list(_recent_writes),
+                        "cause": "unknown",
+                        "idle_seconds": 0,
+                    }
+                    # Classify cause
+                    idle_secs = 0
+                    if _prev_ts and ts:
+                        try:
+                            dt_prev = datetime.fromisoformat(
+                                _prev_ts.replace("Z", "+00:00")
+                            )
+                            dt_now = datetime.fromisoformat(
+                                ts.replace("Z", "+00:00")
+                            )
+                            idle_secs = (dt_now - dt_prev).total_seconds()
+                        except (ValueError, TypeError):
+                            pass
+                    event["idle_seconds"] = idle_secs
+                    if idle_secs > 300:
+                        event["cause"] = "ttl_expiry"
+                    elif _recent_writes:
+                        event["cause"] = "file_change"
+                    elif _prev_cr > 0 and cr < _prev_cr * 0.1:
+                        # Cache read collapsed vs previous message
+                        event["cause"] = "context_change"
+                    else:
+                        event["cause"] = "cache_miss"
+
+                    # Cost of this event: what was paid at cache_write rate
+                    # vs what would have been paid at cache_read rate
+                    p = get_pricing(model)
+                    event["cost"] = (cw / 1e6) * p["cache_write"]
+                    event["saved_if_cached"] = (cw / 1e6) * (
+                        p["cache_write"] - p["cache_read"]
+                    )
+                    r["cache_events"].append(event)
+
+                _prev_ts = ts
+                _prev_cw = cw
+                _prev_cr = cr
+                _recent_writes = []  # reset after processing
+
         content = msg.get("content", [])
         if not isinstance(content, list):
             continue
@@ -807,6 +881,9 @@ def parse_agent_transcript(
                 q = ti.get("url", ti.get("query", ""))
                 if q:
                     r["web_fetches"].append(trunc(q, 80))
+            # Track file-modifying tools for cache invalidation detection
+            if tn in ("Edit", "MultiEdit", "Write", "NotebookEdit"):
+                _recent_writes.append(tn)
 
         # Attribute this message's tokens to the tools it invoked
         u = msg.get("usage", {})
@@ -955,6 +1032,38 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
                 f"{S}  L cache efficiency:{R} {Y}{cache_pct:.0f}%{R} {S}of input from cache{R}",
             )
         )
+
+    # ── Cache invalidation events (prominent, red) ──
+    RED = "\033[91m"
+    cache_events = usage.get("cache_events", [])
+    if cache_events:
+        cause_labels = {
+            "ttl_expiry": "TTL expired (idle >5m)",
+            "file_change": "file changed → context resent",
+            "context_change": "context changed",
+            "cache_miss": "cache miss",
+        }
+        rows.append(
+            ("", f"  {RED}⚠ {len(cache_events)} cache invalidation{'s' if len(cache_events) > 1 else ''} detected{R}")
+        )
+        total_penalty = sum(e.get("saved_if_cached", 0) for e in cache_events)
+        if total_penalty > 0.001:
+            rows.append(
+                ("", f"  {RED}  penalty: ${total_penalty:.4f} wasted on context resend{R}")
+            )
+        for ei, ev in enumerate(cache_events[:5]):  # cap at 5 to avoid box explosion
+            cause = cause_labels.get(ev["cause"], ev["cause"])
+            cw_tok = ev["cache_write_tokens"]
+            idle = ev.get("idle_seconds", 0)
+            idle_str = ""
+            if idle > 0:
+                idle_str = f" after {fmt_duration(idle)} idle"
+            tools_str = ""
+            if ev.get("preceding_tools"):
+                tools_str = f" after {'/'.join(ev['preceding_tools'])}"
+            rows.append(
+                ("", f"  {RED}  #{ei+1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}")
+            )
 
     # Cost — label reflects scope: "(lifetime)" for completed agents, "(this op)" for session
     cost_scope = "(lifetime)" if is_sub else "(this op)"
@@ -1253,6 +1362,37 @@ def build_worktree_report(
                 if sa_cr > 0:
                     parts.append(f"{C}{fmt_tok(sa_cr)}{R} {S}read{R}")
                 rows.append(("", f"    {S}L cache:{R} {f' {S}/{R} '.join(parts)}"))
+
+    # ── Cache invalidation events across all worktree agents ──
+    all_cache_events = []
+    for u in all_usages:
+        all_cache_events.extend(u.get("cache_events", []))
+    if all_cache_events:
+        # Sort by timestamp
+        all_cache_events.sort(key=lambda e: e.get("timestamp", ""))
+        cause_labels = {
+            "ttl_expiry": "TTL expired (idle >5m)",
+            "file_change": "file changed → context resent",
+            "context_change": "context changed",
+            "cache_miss": "cache miss",
+        }
+        total_penalty = sum(e.get("saved_if_cached", 0) for e in all_cache_events)
+        rows.append(
+            ("",
+             f"  {RED}⚠ {len(all_cache_events)} cache invalidation{'s' if len(all_cache_events) > 1 else ''}{R}"
+             + (f" {RED}— ${total_penalty:.4f} penalty{R}" if total_penalty > 0.001 else ""))
+        )
+        for ei, ev in enumerate(all_cache_events[:8]):
+            cause = cause_labels.get(ev["cause"], ev["cause"])
+            cw_tok = ev["cache_write_tokens"]
+            idle = ev.get("idle_seconds", 0)
+            idle_str = f" after {fmt_duration(idle)} idle" if idle > 0 else ""
+            tools_str = ""
+            if ev.get("preceding_tools"):
+                tools_str = f" after {'/'.join(ev['preceding_tools'])}"
+            rows.append(
+                ("", f"  {RED}  #{ei+1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}")
+            )
 
     # ── Tool usage across all worktree agents ──
     combined_tools = Counter()
