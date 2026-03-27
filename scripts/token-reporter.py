@@ -825,12 +825,23 @@ def parse_agent_transcript(
                         except (ValueError, TypeError):
                             pass
                     event["idle_seconds"] = idle_secs
+                    # Classify cause — most specific first
+                    file_tools = [t for t in _recent_writes if t in ("Edit", "MultiEdit", "Write", "NotebookEdit")]
+                    bash_tools = [t for t in _recent_writes if t == "Bash"]
                     if idle_secs > 300:
                         event["cause"] = "ttl_expiry"
-                    elif _recent_writes:
+                    elif file_tools:
+                        # Direct file modification by Claude's own tools
                         event["cause"] = "file_change"
+                    elif bash_tools:
+                        # Bash ran something that modified files on disk;
+                        # file watcher detected the change → cache invalidated
+                        event["cause"] = "bash_side_effect"
+                    elif idle_secs > 10 and not _recent_writes:
+                        # No tool caused it, short idle — file watcher detected
+                        # an external change (another terminal, build system, etc.)
+                        event["cause"] = "external_change"
                     elif _prev_cr > 0 and cr < _prev_cr * 0.1:
-                        # Cache read collapsed vs previous message
                         event["cause"] = "context_change"
                     else:
                         event["cause"] = "cache_miss"
@@ -881,8 +892,11 @@ def parse_agent_transcript(
                 q = ti.get("url", ti.get("query", ""))
                 if q:
                     r["web_fetches"].append(trunc(q, 80))
-            # Track file-modifying tools for cache invalidation detection
-            if tn in ("Edit", "MultiEdit", "Write", "NotebookEdit"):
+            # Track tools that can modify files (triggers loadChangedFiles
+            # via file watchers, causing cache invalidation). Bash is included
+            # because linters/formatters invoked via Bash modify files on disk
+            # and the file watcher detects the change.
+            if tn in ("Edit", "MultiEdit", "Write", "NotebookEdit", "Bash"):
                 _recent_writes.append(tn)
 
         # Attribute this message's tokens to the tools it invoked
@@ -1040,6 +1054,8 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
         cause_labels = {
             "ttl_expiry": "TTL expired (idle >5m)",
             "file_change": "file changed → context resent",
+            "bash_side_effect": "Bash modified files → file watcher invalidated",
+            "external_change": "external file change → file watcher invalidated",
             "context_change": "context changed",
             "cache_miss": "cache miss",
         }
@@ -1064,6 +1080,30 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
             rows.append(
                 ("", f"  {RED}  #{ei+1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}")
             )
+        # Batching opportunity: count invalidations within 60s of each other
+        # that could have been a single reprocess if modifications were grouped
+        if len(cache_events) >= 2:
+            from datetime import datetime as _dt
+            clustered = 0
+            for i_ce in range(1, len(cache_events)):
+                t_prev = cache_events[i_ce - 1].get("timestamp", "")
+                t_curr = cache_events[i_ce].get("timestamp", "")
+                if t_prev and t_curr:
+                    try:
+                        gap = abs(
+                            (_dt.fromisoformat(t_curr.replace("Z", "+00:00"))
+                             - _dt.fromisoformat(t_prev.replace("Z", "+00:00"))
+                            ).total_seconds()
+                        )
+                        if gap < 60:
+                            clustered += 1
+                    except (ValueError, TypeError):
+                        pass
+            if clustered > 0:
+                saved = clustered  # each could have been avoided
+                rows.append(
+                    ("", f"  {Y}⟳ {saved} could be avoided by batching file changes{R}")
+                )
 
     # Cost — label reflects scope: "(lifetime)" for completed agents, "(this op)" for session
     cost_scope = "(lifetime)" if is_sub else "(this op)"
@@ -1373,6 +1413,8 @@ def build_worktree_report(
         cause_labels = {
             "ttl_expiry": "TTL expired (idle >5m)",
             "file_change": "file changed → context resent",
+            "bash_side_effect": "Bash modified files → file watcher invalidated",
+            "external_change": "external file change → file watcher invalidated",
             "context_change": "context changed",
             "cache_miss": "cache miss",
         }
@@ -1393,6 +1435,28 @@ def build_worktree_report(
             rows.append(
                 ("", f"  {RED}  #{ei+1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}")
             )
+        # Batching opportunity in worktree
+        if len(all_cache_events) >= 2:
+            from datetime import datetime as _dt
+            clustered = 0
+            for i_ce in range(1, len(all_cache_events)):
+                t_p = all_cache_events[i_ce - 1].get("timestamp", "")
+                t_c = all_cache_events[i_ce].get("timestamp", "")
+                if t_p and t_c:
+                    try:
+                        gap = abs(
+                            (_dt.fromisoformat(t_c.replace("Z", "+00:00"))
+                             - _dt.fromisoformat(t_p.replace("Z", "+00:00"))
+                            ).total_seconds()
+                        )
+                        if gap < 60:
+                            clustered += 1
+                    except (ValueError, TypeError):
+                        pass
+            if clustered > 0:
+                rows.append(
+                    ("", f"  {Y}⟳ {clustered} could be avoided by batching file changes{R}")
+                )
 
     # ── Tool usage across all worktree agents ──
     combined_tools = Counter()
