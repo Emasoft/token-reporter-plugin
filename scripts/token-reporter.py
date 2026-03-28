@@ -1357,7 +1357,6 @@ def build_worktree_report(
     o = orchestrator_usage
     o_inp = o.get("input_tokens", 0) + o.get("cache_creation_input_tokens", 0)
     o_out = o.get("output_tokens", 0)
-    o_cw = o.get("cache_creation_input_tokens", 0)
     o_cr = o.get("cache_read_input_tokens", 0)
     o_all = o_inp + o_cr
     o_eff = f" {S}cache:{R} {Y}{(o_cr / o_all * 100):.0f}%{R}" if o_all > 0 and o_cr > 0 else ""
