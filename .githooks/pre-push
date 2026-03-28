@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "========================================"
+echo "  Pre-push quality gate"
+echo "========================================"
+
+echo ""
+echo "── 0. Clean working tree ──"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "BLOCKED: uncommitted changes"
+    exit 1
+fi
+echo "OK: working tree clean"
+
+echo ""
+echo "── 1. Lint ──"
+uvx ruff check scripts/token-reporter.py
+uvx ruff format --check scripts/token-reporter.py
+echo "OK: lint passed"
+
+echo ""
+echo "── 2. Syntax check ──"
+python3 -m py_compile scripts/token-reporter.py
+echo "OK: syntax valid"
+
+echo ""
+echo "── 3. Plugin manifest ──"
+python3 -c "import json; json.load(open('.claude-plugin/plugin.json'))"
+echo "OK: plugin.json valid"
+
+echo ""
+echo "========================================"
+echo "  All checks passed — pushing"
+echo "========================================"

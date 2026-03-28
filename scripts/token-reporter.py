@@ -37,6 +37,8 @@ Configure in .claude/settings.json (merge with existing hooks):
 }
 """
 
+from __future__ import annotations
+
 import json
 import sys
 import re
@@ -45,7 +47,8 @@ import time
 import tempfile
 import subprocess
 from pathlib import Path
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
+from typing import Any
 
 
 # ─────────────────────────────────────────────
@@ -104,10 +107,13 @@ def count_tokens(text: str) -> int:
             _tokenizer = tiktoken.get_encoding("cl100k_base")
         except ImportError:
             _tokenizer = None
-            print(
-                "[token-reporter] WARNING: tiktoken not found — token counts will be approximate. Run via 'uv run --with tiktoken' to get exact counts.",
-                file=sys.stderr,
+            msg = (
+                "[token-reporter] WARNING: tiktoken not found"
+                " — token counts will be approximate."
+                " Run via 'uv run --with tiktoken'"
+                " to get exact counts."
             )
+            print(msg, file=sys.stderr)
     if _tokenizer is not None:
         # encode_ordinary skips special token handling — ~30% faster than encode
         return len(_tokenizer.encode_ordinary(text))
@@ -649,25 +655,27 @@ def _detect_skill(user_ctx: str, prompt: str) -> str:
 def parse_agent_transcript(
     path: str, session_id: str, last_op_only: bool = False
 ) -> dict:
-    r = {
+    models_used: defaultdict[str, dict[str, int]] = defaultdict(
+        lambda: {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "message_count": 0,
+        }
+    )
+    tools_tokens: defaultdict[str, dict[str, int]] = defaultdict(
+        lambda: {"input": 0, "output": 0, "result_tokens": 0}
+    )
+    r: dict[str, Any] = {
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
         "message_count": 0,
-        "models_used": defaultdict(
-            lambda: {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "message_count": 0,
-            }
-        ),
+        "models_used": models_used,
         "tools_used": Counter(),
-        "tools_tokens": defaultdict(
-            lambda: {"input": 0, "output": 0, "result_tokens": 0}
-        ),
+        "tools_tokens": tools_tokens,
         "files_read": set(),
         "files_written": set(),
         "files_edited": set(),
@@ -682,7 +690,8 @@ def parse_agent_transcript(
     _prev_ts = ""  # timestamp of previous assistant message
     _prev_cw = 0  # previous cache_creation
     _prev_cr = 0  # previous cache_read
-    _recent_writes = []  # tool names that modify files since last assistant msg
+    # tool names that modify files since last assistant msg
+    _recent_writes: list[str] = []
 
     # Load all entries so we can optionally filter to last operation
     all_entries = list(parse_jsonl(path))
@@ -835,7 +844,7 @@ def parse_agent_transcript(
                         "idle_seconds": 0,
                     }
                     # Classify cause
-                    idle_secs = 0
+                    idle_secs: float = 0
                     if _prev_ts and ts:
                         try:
                             dt_prev = datetime.fromisoformat(
@@ -963,7 +972,7 @@ def build_report(
     hook_input: dict,
     usage: dict,
     identity: dict,
-    sub_usage_list: list = None,
+    sub_usage_list: list[Any] | None = None,
 ) -> str:
     """Build a compact unicode-bordered report for terminal display."""
     is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
@@ -1017,7 +1026,7 @@ def build_report(
     fr = [_rel_path(f, project_dir) for f in usage.get("files_read", [])]
 
     # ── Build rows ──
-    rows = []
+    rows: list[str | tuple[str, str]] = []
 
     # ANSI color palette for dark terminals
     # Principle: ONE color for all static/non-changing text (same as border),
@@ -1052,13 +1061,22 @@ def build_report(
     sub_type = identity.get("subagent_type", "") if is_sub else ""
     type_part = f" {W}{sub_type}{R}" if sub_type else ""
     label_color = "\033[91m" if hook_event == "StopFailure" else S
-    rows.append(
-        f"{label_color}{label}{R}{type_part} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}{duration_str}"
+    header_line = (
+        f"{label_color}{label}{R}{type_part}"
+        f" {H}{short_id}{R}"
+        f" {S}|{R} {W}{model_names}{R}"
+        f" {S}|{R} {W}{msgs}{R}"
+        f" {S}messages{R}{duration_str}"
     )
+    rows.append(header_line)
 
     # Primary tokens (bright yellow values, static labels)
     primary_input = inp + cw
-    tok_val = f"{Y}{fmt_tok(primary_input)}{R} {S}input{R} {S}/{R} {Y}{fmt_tok(out)}{R} {S}output{R}"
+    tok_val = (
+        f"{Y}{fmt_tok(primary_input)}{R}"
+        f" {S}input{R} {S}/{R}"
+        f" {Y}{fmt_tok(out)}{R} {S}output{R}"
+    )
     rows.append(("Tokens", tok_val))
 
     # Cache write — counted toward rate limits
@@ -1076,7 +1094,9 @@ def build_report(
         rows.append(
             (
                 "",
-                f"{S}  L cache efficiency:{R} {Y}{cache_pct:.0f}%{R} {S}of input from cache{R}",
+                f"{S}  L cache efficiency:{R}"
+                f" {Y}{cache_pct:.0f}%{R}"
+                f" {S}of input from cache{R}",
             )
         )
 
@@ -1095,7 +1115,10 @@ def build_report(
         rows.append(
             (
                 "",
-                f"  {RED}⚠ {len(cache_events)} cache invalidation{'s' if len(cache_events) > 1 else ''} detected{R}",
+                f"  {RED}⚠ {len(cache_events)}"
+                f" cache invalidation"
+                f"{'s' if len(cache_events) > 1 else ''}"
+                f" detected{R}",
             )
         )
         total_penalty = sum(e.get("saved_if_cached", 0) for e in cache_events)
@@ -1103,7 +1126,9 @@ def build_report(
             rows.append(
                 (
                     "",
-                    f"  {RED}  penalty: ${total_penalty:.4f} wasted on context resend{R}",
+                    f"  {RED}  penalty:"
+                    f" ${total_penalty:.4f}"
+                    f" wasted on context resend{R}",
                 )
             )
         for ei, ev in enumerate(cache_events[:5]):  # cap at 5 to avoid box explosion
@@ -1119,10 +1144,14 @@ def build_report(
             rows.append(
                 (
                     "",
-                    f"  {RED}  #{ei + 1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}",
+                    f"  {RED}  #{ei + 1}"
+                    f" {fmt_tok(cw_tok)} resent{R}"
+                    f" {S}— {cause}"
+                    f"{idle_str}{tools_str}{R}",
                 )
             )
-        # Batching opportunity: count invalidations within 60s of each other
+        # Batching opportunity: count invalidations
+        # within 60s of each other
         # that could have been a single reprocess if modifications were grouped
         if len(cache_events) >= 2:
             from datetime import datetime as _dt
@@ -1149,7 +1178,8 @@ def build_report(
                     ("", f"  {Y}⟳ {saved} could be avoided by batching file changes{R}")
                 )
 
-    # Cost — label reflects scope: "(lifetime)" for completed agents, "(this op)" for session
+    # Cost — label reflects scope: "(lifetime)" for completed
+    # agents, "(this op)" for session
     cost_scope = "(lifetime)" if is_sub else "(this op)"
     rows.append(("Cost", f"{C}${total_cost:.2f}{R} {S}{cost_scope}{R}"))
 
@@ -1201,7 +1231,10 @@ def build_report(
         rows.append(
             (
                 "MCP",
-                f"{W}{len(mcp_tools_list)}{R} {S}tools{R} {S}/{R} {G}x{total_mcp_calls}{R} {S}calls{R}",
+                f"{W}{len(mcp_tools_list)}{R}"
+                f" {S}tools{R} {S}/{R}"
+                f" {G}x{total_mcp_calls}{R}"
+                f" {S}calls{R}",
             )
         )
         # Each MCP tool on its own line with shortened name and token breakdown
@@ -1284,7 +1317,11 @@ def build_report(
         rows.append(
             (
                 "Sub-agents",
-                f"{W}{n_subs}{R} {S}spawned:{R} {Y}{fmt_tok(sub_total_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(sub_total_out)}{R} {S}out{R}",
+                f"{W}{n_subs}{R} {S}spawned:{R}"
+                f" {Y}{fmt_tok(sub_total_inp)}{R}"
+                f" {S}in{R} {S}/{R}"
+                f" {Y}{fmt_tok(sub_total_out)}{R}"
+                f" {S}out{R}",
             )
         )
         for sa_info, sa_usage in sub_usage_list:
@@ -1300,7 +1337,12 @@ def build_report(
             rows.append(
                 (
                     "",
-                    f"  {S}>{R} {W}{trunc(sa_label, 30)}{R} {Y}{fmt_tok(sa_inp)}{R}{S}/{R}{Y}{fmt_tok(sa_out)}{R}{cost_str}",
+                    f"  {S}>{R}"
+                    f" {W}{trunc(sa_label, 30)}{R}"
+                    f" {Y}{fmt_tok(sa_inp)}{R}"
+                    f"{S}/{R}"
+                    f"{Y}{fmt_tok(sa_out)}{R}"
+                    f"{cost_str}",
                 )
             )
 
@@ -1330,7 +1372,7 @@ def build_worktree_report(
     R = "\033[0m"
     RED = "\033[91m"
 
-    rows = []
+    rows: list[str | tuple[str, str]] = []
 
     # ── Header ──
     n_agents = len(sub_usage_list)
@@ -1372,28 +1414,36 @@ def build_worktree_report(
     rows.append(
         (
             "Tokens",
-            f"{Y}{fmt_tok(total_inp + total_cw)}{R} {S}input{R} {S}/{R} {Y}{fmt_tok(total_out)}{R} {S}output{R}",
+            f"{Y}{fmt_tok(total_inp + total_cw)}{R}"
+            f" {S}input{R} {S}/{R}"
+            f" {Y}{fmt_tok(total_out)}{R}"
+            f" {S}output{R}",
         )
     )
     if total_cw > 0:
         rows.append(
             (
                 "",
-                f"{S}  L cache-write:{R} {Y}{fmt_tok(total_cw)}{R} {S}(billed at 1.25x){R}",
+                f"{S}  L cache-write:{R}"
+                f" {Y}{fmt_tok(total_cw)}{R}"
+                f" {S}(billed at 1.25x){R}",
             )
         )
     if total_cr > 0:
         rows.append(
             (
                 "",
-                f"{S}  L cache-read:{R} {Y}{fmt_tok(total_cr)}{R} {S}(billed at 0.1x){R}",
+                f"{S}  L cache-read:{R}"
+                f" {Y}{fmt_tok(total_cr)}{R}"
+                f" {S}(billed at 0.1x){R}",
             )
         )
 
     # ── Cache efficiency overview ──
     if total_all_input > 0:
         cache_eff = (total_cr / total_all_input) * 100
-        # Color the efficiency: green if good (>50%), yellow if ok (20-50%), red if bad (<20%)
+        # Color the efficiency: green if good (>50%),
+        # yellow if ok (20-50%), red if bad (<20%)
         if cache_eff >= 50:
             eff_color = C
         elif cache_eff >= 20:
@@ -1427,7 +1477,10 @@ def build_worktree_report(
                 rows.append(
                     (
                         "",
-                        f"{S}  L invalidation penalty:{R} {RED}${penalty_cost:.4f}{R} {S}(cache-write that could be cache-read){R}",
+                        f"{S}  L invalidation penalty:{R}"
+                        f" {RED}${penalty_cost:.4f}{R}"
+                        f" {S}(cache-write that could"
+                        f" be cache-read){R}",
                     )
                 )
 
@@ -1446,7 +1499,11 @@ def build_worktree_report(
     rows.append(
         (
             "Orchestrator",
-            f"{Y}{fmt_tok(o_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(o_out)}{R} {S}out{R}{o_eff} {C}${o_cost:.4f}{R}",
+            f"{Y}{fmt_tok(o_inp)}{R}"
+            f" {S}in{R} {S}/{R}"
+            f" {Y}{fmt_tok(o_out)}{R}"
+            f" {S}out{R}{o_eff}"
+            f" {C}${o_cost:.4f}{R}",
         )
     )
 
@@ -1486,7 +1543,11 @@ def build_worktree_report(
             rows.append(
                 (
                     "",
-                    f"    {Y}{fmt_tok(sa_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(sa_out)}{R} {S}out{R}{cache_str} {C}${sa_cost:.4f}{R}",
+                    f"    {Y}{fmt_tok(sa_inp)}{R}"
+                    f" {S}in{R} {S}/{R}"
+                    f" {Y}{fmt_tok(sa_out)}{R}"
+                    f" {S}out{R}{cache_str}"
+                    f" {C}${sa_cost:.4f}{R}",
                 )
             )
             # Show cache write/read breakdown if significant
@@ -1517,7 +1578,9 @@ def build_worktree_report(
         rows.append(
             (
                 "",
-                f"  {RED}⚠ {len(all_cache_events)} cache invalidation{'s' if len(all_cache_events) > 1 else ''}{R}"
+                f"  {RED}⚠ {len(all_cache_events)}"
+                f" cache invalidation"
+                f"{'s' if len(all_cache_events) > 1 else ''}{R}"
                 + (
                     f" {RED}— ${total_penalty:.4f} penalty{R}"
                     if total_penalty > 0.001
@@ -1536,7 +1599,10 @@ def build_worktree_report(
             rows.append(
                 (
                     "",
-                    f"  {RED}  #{ei + 1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}",
+                    f"  {RED}  #{ei + 1}"
+                    f" {fmt_tok(cw_tok)} resent{R}"
+                    f" {S}— {cause}"
+                    f"{idle_str}{tools_str}{R}",
                 )
             )
         # Batching opportunity in worktree
@@ -1563,12 +1629,14 @@ def build_worktree_report(
                 rows.append(
                     (
                         "",
-                        f"  {Y}⟳ {clustered} could be avoided by batching file changes{R}",
+                        f"  {Y}⟳ {clustered}"
+                        f" could be avoided by"
+                        f" batching file changes{R}",
                     )
                 )
 
     # ── Tool usage across all worktree agents ──
-    combined_tools = Counter()
+    combined_tools: Counter[str] = Counter()
     for u in all_usages:
         for tool, count in u.get("tools_used", {}).items():
             combined_tools[tool] += count
@@ -1589,7 +1657,7 @@ def build_worktree_report(
     return _render_box(rows)
 
 
-def _render_box(rows: list) -> str:
+def _render_box(rows: list[str | tuple[str, str]]) -> str:
     """Render rows into a unicode-bordered box with word-wrap."""
     import unicodedata
 
@@ -1622,7 +1690,9 @@ def _render_box(rows: list) -> str:
             return s
         return s + " " * (width - cur)
 
-    header = rows[0]
+    header_raw = rows[0]
+    # The first row is always a plain string (the header line)
+    header: str = header_raw if isinstance(header_raw, str) else header_raw[1]
     data_rows = rows[1:]
 
     TARGET_INNER = 76
@@ -1737,9 +1807,9 @@ def main():
         dbg(f"JSON parse error: {e}")
         sys.exit(1)
 
-    dbg(
-        f"hook_event={hook_input.get('hook_event_name')} session={hook_input.get('session_id', '')[:8]}"
-    )
+    he = hook_input.get("hook_event_name")
+    sid_short = hook_input.get("session_id", "")[:8]
+    dbg(f"hook_event={he} session={sid_short}")
 
     session_id = hook_input.get("session_id", "")
     transcript_path = hook_input.get("transcript_path", "")
@@ -1786,7 +1856,9 @@ def main():
     for attempt in range(max_retries):
         if attempt > 0:
             dbg(
-                f"retry {attempt}/{max_retries - 1}, waiting {retry_delay}s for transcript flush..."
+                f"retry {attempt}/{max_retries - 1},"
+                f" waiting {retry_delay}s"
+                f" for transcript flush..."
             )
             time.sleep(retry_delay)
             retry_delay = min(
@@ -1794,7 +1866,8 @@ def main():
             )  # backoff: 1s, 1.5s, 2.25s, 3.4s, 5s
 
         if agent_transcript_path and Path(agent_transcript_path).exists():
-            # Full lifetime parse — report everything this agent did from start to finish
+            # Full lifetime parse — report everything
+            # this agent did from start to finish
             dbg(f"parsing agent transcript: {agent_transcript_path}")
             usage = parse_agent_transcript(agent_transcript_path, session_id="")
         elif transcript_path:
@@ -1812,7 +1885,11 @@ def main():
         dbg(f"attempt {attempt}: message_count=0")
 
     dbg(
-        f"messages={usage['message_count']} inp={usage['input_tokens']} out={usage['output_tokens']} cw={usage['cache_creation_input_tokens']} cr={usage['cache_read_input_tokens']}"
+        f"messages={usage['message_count']}"
+        f" inp={usage['input_tokens']}"
+        f" out={usage['output_tokens']}"
+        f" cw={usage['cache_creation_input_tokens']}"
+        f" cr={usage['cache_read_input_tokens']}"
     )
     dbg(f"tools={dict(usage.get('tools_used', {}))}")
     dbg(f"tools_tokens={dict(usage.get('tools_tokens', {}))}")

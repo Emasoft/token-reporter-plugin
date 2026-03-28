@@ -1,5 +1,8 @@
 # token-reporter
 
+<!--BADGES-START-->
+<!--BADGES-END-->
+
 A Claude Code plugin that displays per-operation token usage when agents and subagents complete. **Only outputs in debug mode** (`claude --debug`).
 
 ## What it reports
