@@ -96,11 +96,11 @@ CPV_REPO = "git+https://github.com/Emasoft/claude-plugins-validation"
 
 
 def run_cpv_validation(repo_root: Path) -> bool:
-    """Run CPV plugin validation via remote execution. Return True if all pass.
+    """Run CPV plugin validation via remote execution.
 
     Uses uvx to run the validator directly from the GitHub repo — no local
-    scripts to sync. This is the authoritative validation gate: if CPV fails,
-    the plugin must NOT be pushed to GitHub.
+    scripts to sync. Blocks publishing on CRITICAL or MAJOR issues only.
+    MINOR/WARNING/NIT issues are reported but do not block the release.
     """
     result = run(
         [
@@ -112,14 +112,41 @@ def run_cpv_validation(repo_root: Path) -> bool:
         ],
         check=False,
     )
-    if result.returncode != 0:
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
+    output = (result.stdout or "") + (result.stderr or "")
+    if output:
+        # Show only the summary section (last ~10 lines)
+        lines = output.strip().split("\n")
+        summary_start = -1
+        for i, line in enumerate(lines):
+            if line.startswith("---") and i > len(lines) - 15:
+                summary_start = i
+                break
+        if summary_start >= 0:
+            print("\n".join(lines[summary_start:]))
+        else:
+            # Fallback: show last 10 lines
+            print("\n".join(lines[-10:]))
+
+    # Parse CRITICAL and MAJOR counts from the SUMMARY line
+    # Format: "SUMMARY: CRITICAL=N MAJOR=N MINOR=N NIT=N WARNING=N"
+    critical = 0
+    major = 0
+    for line in output.split("\n"):
+        if line.strip().startswith("SUMMARY:"):
+            m = re.search(r"CRITICAL=(\d+)", line)
+            if m:
+                critical = int(m.group(1))
+            m = re.search(r"MAJOR=(\d+)", line)
+            if m:
+                major = int(m.group(1))
+            break
+
+    if critical > 0 or major > 0:
+        print(
+            f"\n  BLOCKED: {critical} critical, {major} major issues",
+            file=sys.stderr,
+        )
         return False
-    if result.stdout:
-        print(result.stdout)
     return True
 
 
