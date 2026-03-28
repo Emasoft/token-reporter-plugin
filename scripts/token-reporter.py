@@ -942,6 +942,7 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
         "SubagentStop": "Subagent",
         "TeammateIdle": "Teammate",
         "TaskCompleted": "Task",
+        "StopFailure": "FAILED",
     }
     label = label_map.get(hook_event, "Session")
     # For subagent events, display the agent_id; for Stop (main session), session_id
@@ -1017,10 +1018,12 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
 
     # Header: static text same as border, dynamic values bright
     # For SubagentStop, show the agent type (e.g. "Subagent Explore a2c30deb")
+    # For StopFailure, show label in red to flag the error
     sub_type = identity.get("subagent_type", "") if is_sub else ""
     type_part = f" {W}{sub_type}{R}" if sub_type else ""
+    label_color = "\033[91m" if hook_event == "StopFailure" else S
     rows.append(
-        f"{S}{label}{R}{type_part} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}{duration_str}"
+        f"{label_color}{label}{R}{type_part} {H}{short_id}{R} {S}|{R} {W}{model_names}{R} {S}|{R} {W}{msgs}{R} {S}messages{R}{duration_str}"
     )
 
     # Primary tokens (bright yellow values, static labels)
@@ -1649,7 +1652,10 @@ def main():
 
     # Subagent-type events: SubagentStop, TeammateIdle, TaskCompleted
     # All report on a child agent's lifecycle, not the main session
+    # StopFailure (v2.1.78): fires when the turn ends due to an API error
+    # (rate limit, auth failure, etc.). Still consumed tokens before failing.
     is_subagent_event = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
+    is_stop_event = hook_event in ("Stop", "StopFailure")
 
     # Step 1: Identity from parent transcript
     identity = {}
@@ -1664,7 +1670,7 @@ def main():
     # For subagent events (SubagentStop/TaskCompleted), parse the FULL agent
     # transcript — report the complete lifetime cost when the agent finishes.
     usage = {}  # type: dict
-    max_retries = 6 if hook_event == "Stop" else 1
+    max_retries = 6 if is_stop_event else 1
     retry_delay = 1.0  # seconds between retries for Stop events
 
     for attempt in range(max_retries):
@@ -1682,7 +1688,7 @@ def main():
             dbg(f"parsing agent transcript: {agent_transcript_path}")
             usage = parse_agent_transcript(agent_transcript_path, session_id="")
         elif transcript_path:
-            is_stop = hook_event == "Stop"
+            is_stop = is_stop_event
             dbg(f"parsing session transcript: {transcript_path} last_op_only={is_stop}")
             usage = parse_agent_transcript(
                 transcript_path, session_id=session_id, last_op_only=is_stop
