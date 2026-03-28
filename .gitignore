@@ -17,6 +17,12 @@ node_modules/
 # Python
 __pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
 
 # Logs
 *.log
@@ -38,3 +44,16 @@ logs/
 
 # LLM Externalizer output
 llm_externalizer_output/
+
+# Editor temp files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Stale rechecker merge-pending files
+rck-*.md
+
+# Reports dev
+reports_dev/

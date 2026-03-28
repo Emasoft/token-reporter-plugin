@@ -92,6 +92,37 @@ def run_checks(repo_root: Path) -> bool:
     return True
 
 
+CPV_REPO = "git+https://github.com/Emasoft/claude-plugins-validation"
+
+
+def run_cpv_validation(repo_root: Path) -> bool:
+    """Run CPV plugin validation via remote execution. Return True if all pass.
+
+    Uses uvx to run the validator directly from the GitHub repo — no local
+    scripts to sync. This is the authoritative validation gate: if CPV fails,
+    the plugin must NOT be pushed to GitHub.
+    """
+    result = run(
+        [
+            "uvx",
+            "--from", CPV_REPO,
+            "--with", "pyyaml",
+            "cpv-validate",
+            str(repo_root),
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        return False
+    if result.stdout:
+        print(result.stdout)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Publish a new release")
     group = parser.add_mutually_exclusive_group()
@@ -133,6 +164,17 @@ def main():
         print("ERROR: checks failed. Fix issues before publishing.", file=sys.stderr)
         sys.exit(1)
     print("  lint: passing | syntax: valid")
+    print()
+
+    # ── 1b. CPV plugin validation (remote, authoritative gate) ──
+    print("── 1b. CPV plugin validation ──")
+    if not run_cpv_validation(repo_root):
+        print(
+            "ERROR: CPV validation failed. Fix issues before publishing.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print("  CPV: all checks passed")
     print()
 
     # ── 2. Bump version ──
