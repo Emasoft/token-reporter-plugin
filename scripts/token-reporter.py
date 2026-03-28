@@ -311,39 +311,54 @@ def discover_subagent_transcripts(transcript_path: str) -> list:
             except (json.JSONDecodeError, OSError):
                 pass
         agent_id = f.stem[6:] if f.stem.startswith("agent-") else f.stem
-        results.append({
-            "path": str(f),
-            "agent_id": agent_id,
-            "agent_type": meta.get("agentType", ""),
-            "description": meta.get("description", ""),
-        })
+        results.append(
+            {
+                "path": str(f),
+                "agent_id": agent_id,
+                "agent_type": meta.get("agentType", ""),
+                "description": meta.get("description", ""),
+            }
+        )
     return results
 
 
 def _merge_usage(base: dict, add: dict):
     """Merge token usage from add into base (in place)."""
-    for f in ["input_tokens", "output_tokens", "cache_creation_input_tokens",
-              "cache_read_input_tokens", "message_count"]:
+    for f in [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "message_count",
+    ]:
         base[f] = base.get(f, 0) + add.get(f, 0)
     # Merge models_used
     for model, stats in add.get("models_used", {}).items():
         if model not in base.get("models_used", {}):
             base.setdefault("models_used", {})[model] = {
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
                 "message_count": 0,
             }
-        for f in ["input_tokens", "output_tokens", "cache_creation_input_tokens",
-                   "cache_read_input_tokens", "message_count"]:
+        for f in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "message_count",
+        ]:
             base["models_used"][model][f] += stats.get(f, 0)
     # Merge tools
     for tool, count in add.get("tools_used", {}).items():
         base.setdefault("tools_used", Counter())[tool] += count
     for tool, tok in add.get("tools_tokens", {}).items():
         if tool not in base.get("tools_tokens", {}):
-            base.setdefault("tools_tokens", defaultdict(
-                lambda: {"input": 0, "output": 0, "result_tokens": 0}
-            ))
+            base.setdefault(
+                "tools_tokens",
+                defaultdict(lambda: {"input": 0, "output": 0, "result_tokens": 0}),
+            )
         for f in ["input", "output", "result_tokens"]:
             base["tools_tokens"][tool][f] += tok.get(f, 0)
     # Merge file sets
@@ -418,7 +433,10 @@ def _build_tool_agent_map(entries: list) -> dict:
             content = msg.get("content", []) if isinstance(msg, dict) else []
             if isinstance(content, list):
                 for block in content:
-                    if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    if (
+                        not isinstance(block, dict)
+                        or block.get("type") != "tool_result"
+                    ):
                         continue
                     tuid = block.get("tool_use_id", "")
                     rc = block.get("content", "")
@@ -490,7 +508,10 @@ def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") != "tool_use" or block.get("name") not in ("Task", "Agent"):
+            if block.get("type") != "tool_use" or block.get("name") not in (
+                "Task",
+                "Agent",
+            ):
                 continue
 
             ti = block.get("input", {})
@@ -521,8 +542,11 @@ def extract_agent_identity(transcript_path: str, agent_id: str) -> dict:
         if not isinstance(msg, dict):
             continue
         for block in msg.get("content", []):
-            if (isinstance(block, dict) and block.get("type") == "tool_use"
-                    and block.get("name") in ("Task", "Agent")):
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") in ("Task", "Agent")
+            ):
                 ti = block.get("input", {})
                 if isinstance(ti, dict):
                     task_inputs.append(ti)
@@ -655,9 +679,9 @@ def parse_agent_transcript(
     }
     seen = set()
     # State for cache invalidation detection
-    _prev_ts = ""        # timestamp of previous assistant message
-    _prev_cw = 0         # previous cache_creation
-    _prev_cr = 0         # previous cache_read
+    _prev_ts = ""  # timestamp of previous assistant message
+    _prev_cw = 0  # previous cache_creation
+    _prev_cr = 0  # previous cache_read
     _recent_writes = []  # tool names that modify files since last assistant msg
 
     # Load all entries so we can optionally filter to last operation
@@ -752,7 +776,9 @@ def parse_agent_transcript(
                             text = result_content
                         else:
                             text = str(result_content)
-                        r["tools_tokens"][tool_name]["result_tokens"] += count_tokens(text)
+                        r["tools_tokens"][tool_name]["result_tokens"] += count_tokens(
+                            text
+                        )
             continue
 
         # ── Process assistant entries ──
@@ -794,13 +820,10 @@ def parse_agent_transcript(
                 inp = u.get("input_tokens", 0)
                 total_cache = cw + cr
                 # Detect: cache_creation dominates (>80%) AND is substantial (>50K)
-                is_spike = (
-                    cw > 50_000
-                    and total_cache > 0
-                    and (cw / total_cache) > 0.80
-                )
+                is_spike = cw > 50_000 and total_cache > 0 and (cw / total_cache) > 0.80
                 if is_spike:
                     from datetime import datetime
+
                     event = {
                         "cache_write_tokens": cw,
                         "cache_read_tokens": cr,
@@ -818,15 +841,17 @@ def parse_agent_transcript(
                             dt_prev = datetime.fromisoformat(
                                 _prev_ts.replace("Z", "+00:00")
                             )
-                            dt_now = datetime.fromisoformat(
-                                ts.replace("Z", "+00:00")
-                            )
+                            dt_now = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                             idle_secs = (dt_now - dt_prev).total_seconds()
                         except (ValueError, TypeError):
                             pass
                     event["idle_seconds"] = idle_secs
                     # Classify cause — most specific first
-                    file_tools = [t for t in _recent_writes if t in ("Edit", "MultiEdit", "Write", "NotebookEdit")]
+                    file_tools = [
+                        t
+                        for t in _recent_writes
+                        if t in ("Edit", "MultiEdit", "Write", "NotebookEdit")
+                    ]
                     bash_tools = [t for t in _recent_writes if t == "Bash"]
                     if idle_secs > 300:
                         event["cause"] = "ttl_expiry"
@@ -933,8 +958,13 @@ def _rel_path(filepath: str, project_dir: str) -> str:
             return filepath
 
 
-def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
-                  sub_usage_list: list = None) -> str:
+def build_report(
+    hook_event: str,
+    hook_input: dict,
+    usage: dict,
+    identity: dict,
+    sub_usage_list: list = None,
+) -> str:
     """Build a compact unicode-bordered report for terminal display."""
     is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
     # Show the hook event type as the label for teammate/task events
@@ -1063,12 +1093,18 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
             "cache_miss": "cache miss",
         }
         rows.append(
-            ("", f"  {RED}⚠ {len(cache_events)} cache invalidation{'s' if len(cache_events) > 1 else ''} detected{R}")
+            (
+                "",
+                f"  {RED}⚠ {len(cache_events)} cache invalidation{'s' if len(cache_events) > 1 else ''} detected{R}",
+            )
         )
         total_penalty = sum(e.get("saved_if_cached", 0) for e in cache_events)
         if total_penalty > 0.001:
             rows.append(
-                ("", f"  {RED}  penalty: ${total_penalty:.4f} wasted on context resend{R}")
+                (
+                    "",
+                    f"  {RED}  penalty: ${total_penalty:.4f} wasted on context resend{R}",
+                )
             )
         for ei, ev in enumerate(cache_events[:5]):  # cap at 5 to avoid box explosion
             cause = cause_labels.get(ev["cause"], ev["cause"])
@@ -1081,12 +1117,16 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
             if ev.get("preceding_tools"):
                 tools_str = f" after {'/'.join(ev['preceding_tools'])}"
             rows.append(
-                ("", f"  {RED}  #{ei+1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}")
+                (
+                    "",
+                    f"  {RED}  #{ei + 1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}",
+                )
             )
         # Batching opportunity: count invalidations within 60s of each other
         # that could have been a single reprocess if modifications were grouped
         if len(cache_events) >= 2:
             from datetime import datetime as _dt
+
             clustered = 0
             for i_ce in range(1, len(cache_events)):
                 t_prev = cache_events[i_ce - 1].get("timestamp", "")
@@ -1094,8 +1134,9 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
                 if t_prev and t_curr:
                     try:
                         gap = abs(
-                            (_dt.fromisoformat(t_curr.replace("Z", "+00:00"))
-                             - _dt.fromisoformat(t_prev.replace("Z", "+00:00"))
+                            (
+                                _dt.fromisoformat(t_curr.replace("Z", "+00:00"))
+                                - _dt.fromisoformat(t_prev.replace("Z", "+00:00"))
                             ).total_seconds()
                         )
                         if gap < 60:
@@ -1235,11 +1276,16 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
     # (e.g., a worktree skill that launches a swarm of sub-agents)
     if sub_usage_list:
         n_subs = len(sub_usage_list)
-        sub_total_inp = sum(u["input_tokens"] + u["cache_creation_input_tokens"] for _, u in sub_usage_list)
+        sub_total_inp = sum(
+            u["input_tokens"] + u["cache_creation_input_tokens"]
+            for _, u in sub_usage_list
+        )
         sub_total_out = sum(u["output_tokens"] for _, u in sub_usage_list)
         rows.append(
-            ("Sub-agents",
-             f"{W}{n_subs}{R} {S}spawned:{R} {Y}{fmt_tok(sub_total_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(sub_total_out)}{R} {S}out{R}")
+            (
+                "Sub-agents",
+                f"{W}{n_subs}{R} {S}spawned:{R} {Y}{fmt_tok(sub_total_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(sub_total_out)}{R} {S}out{R}",
+            )
         )
         for sa_info, sa_usage in sub_usage_list:
             sa_type = sa_info.get("agent_type", "")
@@ -1247,9 +1293,16 @@ def build_report(hook_event: str, hook_input: dict, usage: dict, identity: dict,
             sa_label = sa_type or sa_desc or sa_info["agent_id"][:12]
             sa_inp = sa_usage["input_tokens"] + sa_usage["cache_creation_input_tokens"]
             sa_out = sa_usage["output_tokens"]
-            sa_cost = sum(estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items())
+            sa_cost = sum(
+                estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items()
+            )
             cost_str = f" {C}${sa_cost:.4f}{R}" if sa_cost > 0 else ""
-            rows.append(("", f"  {S}>{R} {W}{trunc(sa_label, 30)}{R} {Y}{fmt_tok(sa_inp)}{R}{S}/{R}{Y}{fmt_tok(sa_out)}{R}{cost_str}"))
+            rows.append(
+                (
+                    "",
+                    f"  {S}>{R} {W}{trunc(sa_label, 30)}{R} {Y}{fmt_tok(sa_inp)}{R}{S}/{R}{Y}{fmt_tok(sa_out)}{R}{cost_str}",
+                )
+            )
 
     return _render_box(rows)
 
@@ -1304,7 +1357,7 @@ def build_worktree_report(
         pass
     # Trim to just the meaningful tail
     if "/worktrees/" in wt_label:
-        wt_label = wt_label[wt_label.index("/worktrees/"):]
+        wt_label = wt_label[wt_label.index("/worktrees/") :]
     elif len(wt_label) > 50:
         wt_label = "..." + wt_label[-47:]
 
@@ -1316,11 +1369,26 @@ def build_worktree_report(
     )
 
     # ── Totals ──
-    rows.append(("Tokens", f"{Y}{fmt_tok(total_inp + total_cw)}{R} {S}input{R} {S}/{R} {Y}{fmt_tok(total_out)}{R} {S}output{R}"))
+    rows.append(
+        (
+            "Tokens",
+            f"{Y}{fmt_tok(total_inp + total_cw)}{R} {S}input{R} {S}/{R} {Y}{fmt_tok(total_out)}{R} {S}output{R}",
+        )
+    )
     if total_cw > 0:
-        rows.append(("", f"{S}  L cache-write:{R} {Y}{fmt_tok(total_cw)}{R} {S}(billed at 1.25x){R}"))
+        rows.append(
+            (
+                "",
+                f"{S}  L cache-write:{R} {Y}{fmt_tok(total_cw)}{R} {S}(billed at 1.25x){R}",
+            )
+        )
     if total_cr > 0:
-        rows.append(("", f"{S}  L cache-read:{R} {Y}{fmt_tok(total_cr)}{R} {S}(billed at 0.1x){R}"))
+        rows.append(
+            (
+                "",
+                f"{S}  L cache-read:{R} {Y}{fmt_tok(total_cr)}{R} {S}(billed at 0.1x){R}",
+            )
+        )
 
     # ── Cache efficiency overview ──
     if total_all_input > 0:
@@ -1332,7 +1400,12 @@ def build_worktree_report(
             eff_color = Y
         else:
             eff_color = RED
-        rows.append(("Cache", f"{eff_color}{cache_eff:.0f}%{R} {S}of all input served from cache{R}"))
+        rows.append(
+            (
+                "Cache",
+                f"{eff_color}{cache_eff:.0f}%{R} {S}of all input served from cache{R}",
+            )
+        )
 
         # Cache invalidation penalty: cache_write tokens that COULD have been
         # cache_read if the cache wasn't invalidated. The cost delta is:
@@ -1351,7 +1424,12 @@ def build_worktree_report(
                 break
             penalty_cost = (total_cw / 1e6) * (avg_cw_price - avg_cr_price)
             if penalty_cost > 0.001:
-                rows.append(("", f"{S}  L invalidation penalty:{R} {RED}${penalty_cost:.4f}{R} {S}(cache-write that could be cache-read){R}"))
+                rows.append(
+                    (
+                        "",
+                        f"{S}  L invalidation penalty:{R} {RED}${penalty_cost:.4f}{R} {S}(cache-write that could be cache-read){R}",
+                    )
+                )
 
     # ── Orchestrator row ──
     o = orchestrator_usage
@@ -1359,10 +1437,18 @@ def build_worktree_report(
     o_out = o.get("output_tokens", 0)
     o_cr = o.get("cache_read_input_tokens", 0)
     o_all = o_inp + o_cr
-    o_eff = f" {S}cache:{R} {Y}{(o_cr / o_all * 100):.0f}%{R}" if o_all > 0 and o_cr > 0 else ""
+    o_eff = (
+        f" {S}cache:{R} {Y}{(o_cr / o_all * 100):.0f}%{R}"
+        if o_all > 0 and o_cr > 0
+        else ""
+    )
     o_cost = sum(estimate_cost(s, m) for m, s in o.get("models_used", {}).items())
-    rows.append(("Orchestrator",
-                 f"{Y}{fmt_tok(o_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(o_out)}{R} {S}out{R}{o_eff} {C}${o_cost:.4f}{R}"))
+    rows.append(
+        (
+            "Orchestrator",
+            f"{Y}{fmt_tok(o_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(o_out)}{R} {S}out{R}{o_eff} {C}${o_cost:.4f}{R}",
+        )
+    )
 
     # ── Per-agent breakdown ──
     if sub_usage_list:
@@ -1377,7 +1463,9 @@ def build_worktree_report(
             sa_cr = sa_usage["cache_read_input_tokens"]
             sa_all_input = sa_inp + sa_cr
             sa_msgs = sa_usage["message_count"]
-            sa_cost = sum(estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items())
+            sa_cost = sum(
+                estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items()
+            )
 
             # Cache efficiency per agent
             cache_str = ""
@@ -1395,7 +1483,12 @@ def build_worktree_report(
                     cache_str += f" {RED}invalidated{R}"
 
             rows.append(("", f"  {S}>{R} {W}{sa_label}{R} {S}({sa_msgs} msgs){R}"))
-            rows.append(("", f"    {Y}{fmt_tok(sa_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(sa_out)}{R} {S}out{R}{cache_str} {C}${sa_cost:.4f}{R}"))
+            rows.append(
+                (
+                    "",
+                    f"    {Y}{fmt_tok(sa_inp)}{R} {S}in{R} {S}/{R} {Y}{fmt_tok(sa_out)}{R} {S}out{R}{cache_str} {C}${sa_cost:.4f}{R}",
+                )
+            )
             # Show cache write/read breakdown if significant
             if sa_cw > 0 or sa_cr > 0:
                 parts = []
@@ -1422,9 +1515,15 @@ def build_worktree_report(
         }
         total_penalty = sum(e.get("saved_if_cached", 0) for e in all_cache_events)
         rows.append(
-            ("",
-             f"  {RED}⚠ {len(all_cache_events)} cache invalidation{'s' if len(all_cache_events) > 1 else ''}{R}"
-             + (f" {RED}— ${total_penalty:.4f} penalty{R}" if total_penalty > 0.001 else ""))
+            (
+                "",
+                f"  {RED}⚠ {len(all_cache_events)} cache invalidation{'s' if len(all_cache_events) > 1 else ''}{R}"
+                + (
+                    f" {RED}— ${total_penalty:.4f} penalty{R}"
+                    if total_penalty > 0.001
+                    else ""
+                ),
+            )
         )
         for ei, ev in enumerate(all_cache_events[:8]):
             cause = cause_labels.get(ev["cause"], ev["cause"])
@@ -1435,11 +1534,15 @@ def build_worktree_report(
             if ev.get("preceding_tools"):
                 tools_str = f" after {'/'.join(ev['preceding_tools'])}"
             rows.append(
-                ("", f"  {RED}  #{ei+1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}")
+                (
+                    "",
+                    f"  {RED}  #{ei + 1} {fmt_tok(cw_tok)} resent{R} {S}— {cause}{idle_str}{tools_str}{R}",
+                )
             )
         # Batching opportunity in worktree
         if len(all_cache_events) >= 2:
             from datetime import datetime as _dt
+
             clustered = 0
             for i_ce in range(1, len(all_cache_events)):
                 t_p = all_cache_events[i_ce - 1].get("timestamp", "")
@@ -1447,8 +1550,9 @@ def build_worktree_report(
                 if t_p and t_c:
                     try:
                         gap = abs(
-                            (_dt.fromisoformat(t_c.replace("Z", "+00:00"))
-                             - _dt.fromisoformat(t_p.replace("Z", "+00:00"))
+                            (
+                                _dt.fromisoformat(t_c.replace("Z", "+00:00"))
+                                - _dt.fromisoformat(t_p.replace("Z", "+00:00"))
                             ).total_seconds()
                         )
                         if gap < 60:
@@ -1457,7 +1561,10 @@ def build_worktree_report(
                         pass
             if clustered > 0:
                 rows.append(
-                    ("", f"  {Y}⟳ {clustered} could be avoided by batching file changes{R}")
+                    (
+                        "",
+                        f"  {Y}⟳ {clustered} could be avoided by batching file changes{R}",
+                    )
                 )
 
     # ── Tool usage across all worktree agents ──
@@ -1466,10 +1573,14 @@ def build_worktree_report(
         for tool, count in u.get("tools_used", {}).items():
             combined_tools[tool] += count
     if combined_tools:
-        regular = [(t, c) for t, c in combined_tools.most_common() if not t.startswith("mcp__")]
+        regular = [
+            (t, c) for t, c in combined_tools.most_common() if not t.startswith("mcp__")
+        ]
         mcp = [(t, c) for t, c in combined_tools.most_common() if t.startswith("mcp__")]
         if regular:
-            tool_str = f" {S}/{R} ".join(f"{W}{t}{R} {G}x{c}{R}" for t, c in regular[:8])
+            tool_str = f" {S}/{R} ".join(
+                f"{W}{t}{R} {G}x{c}{R}" for t, c in regular[:8]
+            )
             rows.append(("Tools", tool_str))
         if mcp:
             for t, c in mcp[:5]:
