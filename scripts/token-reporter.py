@@ -359,14 +359,15 @@ def _merge_usage(base: dict, add: dict):
     # Merge tools
     for tool, count in add.get("tools_used", {}).items():
         base.setdefault("tools_used", Counter())[tool] += count
+    base_tt = base.setdefault(
+        "tools_tokens",
+        defaultdict(lambda: {"input": 0, "output": 0, "result_tokens": 0}),
+    )
     for tool, tok in add.get("tools_tokens", {}).items():
-        if tool not in base.get("tools_tokens", {}):
-            base.setdefault(
-                "tools_tokens",
-                defaultdict(lambda: {"input": 0, "output": 0, "result_tokens": 0}),
-            )
+        if tool not in base_tt:
+            base_tt[tool] = {"input": 0, "output": 0, "result_tokens": 0}
         for f in ["input", "output", "result_tokens"]:
-            base["tools_tokens"][tool][f] += tok.get(f, 0)
+            base_tt[tool][f] += tok.get(f, 0)
     # Merge file sets
     for f in ["files_read", "files_written", "files_edited"]:
         existing = base.get(f, [])
@@ -688,7 +689,6 @@ def parse_agent_transcript(
     seen = set()
     # State for cache invalidation detection
     _prev_ts = ""  # timestamp of previous assistant message
-    _prev_cw = 0  # previous cache_creation
     _prev_cr = 0  # previous cache_read
     # tool names that modify files since last assistant msg
     _recent_writes: list[str] = []
@@ -890,7 +890,6 @@ def parse_agent_transcript(
                     r["cache_events"].append(event)
 
                 _prev_ts = ts
-                _prev_cw = cw
                 _prev_cr = cr
                 _recent_writes = []  # reset after processing
 
@@ -1971,6 +1970,23 @@ def main():
     # Combine: subagent reports first, then main session report
     all_reports = subagent_reports + [report]
     combined = "\n".join(all_reports)
+
+    # v2.1.89: hook output >50K chars is saved to disk with a preview
+    # instead of being injected into context. Cap our output to avoid this.
+    MAX_HOOK_OUTPUT = 48_000  # leave headroom below 50K
+    if len(combined) > MAX_HOOK_OUTPUT:
+        dbg(
+            f"WARNING: output {len(combined)} chars exceeds {MAX_HOOK_OUTPUT}, "
+            f"truncating to fit hook output limit"
+        )
+        # Keep the main session report (last entry), drop oldest subagent reports
+        while len(combined) > MAX_HOOK_OUTPUT and len(all_reports) > 1:
+            dropped = all_reports.pop(0)
+            dbg(f"  dropped subagent report ({len(dropped)} chars)")
+            combined = "\n".join(all_reports)
+        # If still too large, hard-truncate
+        if len(combined) > MAX_HOOK_OUTPUT:
+            combined = combined[:MAX_HOOK_OUTPUT] + "\n[...truncated]"
 
     output = {"systemMessage": combined}
     print(json.dumps(output))
