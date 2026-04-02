@@ -12,6 +12,13 @@ After each Claude Code response (in debug mode), a compact unicode-bordered repo
 - **Token counts** — fresh input + cache-write (what counts toward rate limits) and output
 - **Cache breakdown** — cache-write (included in limits) and cache-read (excluded) shown separately
 - **Cache efficiency** — percentage of total input that came from cache
+- **Cache invalidation detection** — detects and flags cache busts with cause classification:
+  - TTL expiry ("hey!" effect — idle >5 min, millions of tokens burned on resume)
+  - File change (Edit/Write triggers `loadChangedFiles()`)
+  - Bash side effect (linter/formatter modifies files → file watcher invalidates)
+  - External change (file watcher detects non-Claude modifications)
+  - Penalty cost and batching opportunity analysis
+- **Worktree sub-agent breakdown** — dedicated box showing per-agent cache dynamics when skills spawn agent swarms in worktrees
 - **Duration** — elapsed time from first to last message in the operation
 - **Per-tool attribution** — input, output, and result tokens for each tool used
 - **Cost estimate** — based on published Anthropic API pricing, scoped to lifetime (agents) or current operation (session)
@@ -53,9 +60,9 @@ After each Claude Code response (in debug mode), a compact unicode-bordered repo
 │            L Edit x3: 890 out / 245 result→input                             │
 │            L Read x2: 251 out / 6.3K result→input                            │
 │ MCP      │ 3 tools / x10 calls                                               │
-│            L mcp__chrome-devtools__take_screenshot x3: 2.1K result→input      │
-│            L mcp__chrome-devtools__navigate_page x2: 89 out / 1.2K r→input    │
-│            L mcp__grepika__search x5: 200 out / 3.1K result→input             │
+│            L chrome-devtools:take_screenshot x3: 2.1K result→input            │
+│            L chrome-devtools:navigate_page x2: 89 out / 1.2K r→input          │
+│            L grepika:search x5: 200 out / 3.1K result→input                   │
 │            L total result→input: 97.1K                                        │
 │ Bash     │ 12 commands                                                        │
 │            $ git status                                                       │
@@ -78,16 +85,17 @@ After each Claude Code response (in debug mode), a compact unicode-bordered repo
 
 ### MCP tools section
 
-MCP tool names (e.g. `mcp__chrome-devtools__take_screenshot`) are too long for inline display on the `Tools` row. They get their own **MCP** section, listed vertically one per line with the full tool name:
+MCP tool names (e.g. `mcp__chrome-devtools__take_screenshot`) are shortened to `server:tool` format (e.g. `chrome-devtools:take_screenshot`) for display:
 
 - **`MCP`** row shows total tool count and call count
-- Each tool listed below with full name, call count, and token breakdown
+- Each tool listed below with shortened name, call count, and token breakdown
+- Long lines wrap within the 80-column box with content-aligned continuation
 
 ## Prerequisites
 
 - **uv** — the script runs via `uv run --with tiktoken` to manage the tiktoken dependency automatically
 - **Python 3.8+** — any Python 3.8+ accessible to uv
-- **Claude Code 2.1.69+** — for TeammateIdle/TaskCompleted hook support (Stop and SubagentStop work on older versions)
+- **Claude Code 2.1.85+** — for v2.1.85 JSONL format (agentId removed, toolUseResult.agentId added). StopFailure requires 2.1.78+. TeammateIdle/TaskCompleted require 2.1.69+
 
 Install uv if you don't have it:
 ```bash
@@ -179,12 +187,14 @@ token-reporter/
     workflows/
       notify-marketplace.yml  # Auto-notify emasoft-plugins on version bump
   hooks/
-    hooks.json             # Hook event → command mapping
+    hooks.json             # Hook event → command mapping (5 events)
   scripts/
-    token-reporter.py      # Main hook script
+    token-reporter.py      # Main hook script (~1900 LOC)
     bump_version.py        # Semver bumper for plugin.json
-    publish.py             # Full release pipeline (lint, bump, tag, push, gh release)
-    pre-push               # Git pre-push quality gate hook
+    publish.py             # Release pipeline (lint, CPV validation, bump, tag, push, gh release)
+    pre-push               # Git pre-push quality gate (symlinked to .git/hooks/pre-push)
+  pyproject.toml           # Python project metadata and tool config
+  cliff.toml               # Changelog generation config (git-cliff)
 ```
 
 ### 4. Verify
@@ -201,11 +211,12 @@ Without `--debug`, the hook exits immediately with no output.
 
 ## How it works
 
-The plugin registers four hook events in `hooks/hooks.json`:
+The plugin registers five hook events in `hooks/hooks.json`:
 
 | Hook Event | When it fires | What the script does | Cost label |
 |---|---|---|---|
 | **Stop** | Main session response complete | Parses session transcript (since last user prompt), collects any saved subagent reports, displays all together | `(this op)` |
+| **StopFailure** | Turn ends due to API error (rate limit, auth) | Same as Stop — tokens are still consumed before the error | `(this op)` |
 | **SubagentStop** | Subagent (Explore, Plan, etc.) finished | Parses agent's full lifetime transcript | `(lifetime)` |
 | **TeammateIdle** | Teammate agent paused/waiting | Same as SubagentStop | `(lifetime)` |
 | **TaskCompleted** | Background task finished | Same as SubagentStop | `(lifetime)` |

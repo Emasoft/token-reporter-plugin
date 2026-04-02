@@ -42,6 +42,9 @@ logs/
 # Rechecker artifacts
 .rechecker/
 
+# Serena (local dev config)
+.serena/
+
 # LLM Externalizer output
 llm_externalizer_output/
 
