@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] - 2026-04-10
+
+
+### Features
+
+- Pre-push hook uses process ancestry (not env vars) for publish gate
+
 ## [1.5.0] - 2026-04-10
 
 
