@@ -60,3 +60,4 @@ rck-*.md
 
 # Reports dev
 reports_dev/
+uv.lock
