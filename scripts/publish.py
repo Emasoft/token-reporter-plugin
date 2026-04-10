@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a new release: bump version, update changelog, tag, push, create GitHub release.
+"""Publish a new release with mandatory quality gates.
 
 Usage:
     uv run scripts/publish.py              # bump patch (default)
@@ -7,52 +7,112 @@ Usage:
     uv run scripts/publish.py --minor      # 1.1.0 -> 1.2.0
     uv run scripts/publish.py --major      # 1.1.0 -> 2.0.0
     uv run scripts/publish.py --set 2.0.0  # explicit version
-    uv run scripts/publish.py --dry-run    # preview without changes
+    uv run scripts/publish.py --dry-run    # preview — still runs all checks
 
-Steps:
-    1. Verify clean working tree
-    2. Run lint and syntax checks (before any modifications)
-    3. Bump version in plugin.json
-    4. Run git-cliff to regenerate CHANGELOG.md (if git-cliff is available)
-    5. Commit version bump + changelog
-    6. Create annotated git tag (vX.Y.Z)
-    7. Push commits and tags (pre-push hook runs validation again as gate)
-    8. Create GitHub release with changelog entry as release notes
+MANDATORY QUALITY GATES (in order, all unskippable, all must return 0 errors):
+    0.  Tool availability:    uvx, python3, git, gh, git-cliff, uv all installed
+    1.  Pre-push hook:        .git/hooks/pre-push exists and is executable
+    2.  Clean working tree:   no uncommitted or staged changes
+    3.  Lint (all .py files): ruff check + ruff format --check
+    4.  Type check:           mypy on token-reporter.py (0 errors)
+    5.  Syntax check:         py_compile all .py files in scripts/
+    6.  Test suite:           every test in tests_dev/ passes (0 failures)
+    7.  CPV validation:       remote cpv-validate, summary must be all 0s
+    8.  Version bump:         plugin.json AND pyproject.toml updated atomically
+    9.  CPV re-validation:    post-bump verification
+    10. Changelog:            git-cliff regenerates CHANGELOG.md (MANDATORY)
+    11. Commit:               version + changelog, verified afterwards
+    12. Tag:                  annotated tag, verified to exist
+    13. Push:                 git push --follow-tags (pre-push hook is another gate)
+    14. GitHub release:       gh release create, verified to exist
+
+NO EXCEPTIONS. NO SKIPS. Any failure at ANY step aborts the release.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 
-def run(
-    cmd: list[str], *, check: bool = True, capture: bool = True
+# ─────────────────────────────────────────────
+# Output helpers
+# ─────────────────────────────────────────────
+
+
+def die(msg: str, *, hint: str = "") -> NoReturn:
+    """Print an error and abort the release. Never returns."""
+    print(f"\n\033[91mBLOCKED\033[0m: {msg}", file=sys.stderr)
+    if hint:
+        print(f"  hint: {hint}", file=sys.stderr)
+    sys.exit(1)
+
+
+def step(n: str, title: str) -> None:
+    print(f"\n── {n}. {title} ──")
+
+
+def ok(msg: str) -> None:
+    print(f"  \033[92mOK\033[0m: {msg}")
+
+
+# ─────────────────────────────────────────────
+# Subprocess wrappers
+# ─────────────────────────────────────────────
+
+
+def run_strict(
+    cmd: list[str], *, cwd: Path | None = None
 ) -> subprocess.CompletedProcess:
-    """Run a command, printing it first. Fail-fast on error."""
+    """Run a command and abort the release on non-zero exit code.
+
+    Used for commands that MUST succeed. No caller can accidentally ignore
+    the return code because we call die() on failure here.
+    """
     print(f"  $ {' '.join(cmd)}")
-    return subprocess.run(cmd, check=check, capture_output=capture, text=True)
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        die(f"command failed with exit code {result.returncode}: {' '.join(cmd)}")
+    return result
+
+
+def run_probe(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Run a command for its return code; capture output but do not abort.
+
+    Only used where the return code is explicitly inspected by the caller.
+    """
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+# ─────────────────────────────────────────────
+# Semver helpers
+# ─────────────────────────────────────────────
 
 
 def bump_version(current: str, part: str) -> str:
-    """Bump a semver string by the specified part."""
     parts = current.split(".")
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
-        print(f"ERROR: '{current}' is not valid semver (x.y.z)", file=sys.stderr)
-        sys.exit(1)
+        die(f"'{current}' is not valid semver (x.y.z)")
     major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
     if part == "major":
         return f"{major + 1}.0.0"
-    elif part == "minor":
+    if part == "minor":
         return f"{major}.{minor + 1}.0"
     return f"{major}.{minor}.{patch + 1}"
 
 
 def extract_release_notes(changelog_path: Path, version: str) -> str:
-    """Extract the changelog entry for a specific version."""
     if not changelog_path.exists():
         return f"Release v{version}"
     content = changelog_path.read_text(encoding="utf-8")
@@ -63,65 +123,361 @@ def extract_release_notes(changelog_path: Path, version: str) -> str:
     return match.group(1).strip()
 
 
-def run_checks(repo_root: Path) -> bool:
-    """Run lint and syntax checks. Return True if all pass."""
-    script = repo_root / "scripts" / "token-reporter.py"
+# ─────────────────────────────────────────────
+# GATE 0: tool availability
+# ─────────────────────────────────────────────
 
-    # Lint (ruff check + format check)
-    lint = run(["uvx", "ruff", "check", str(script)], check=False)
-    fmt = run(["uvx", "ruff", "format", "--check", str(script)], check=False)
-    lint_ok = lint.returncode == 0 and fmt.returncode == 0
-    if not lint_ok:
-        if lint.stdout:
-            print(lint.stdout)
-        if lint.stderr:
-            print(lint.stderr, file=sys.stderr)
-        if fmt.stdout:
-            print(fmt.stdout)
-        if fmt.stderr:
-            print(fmt.stderr, file=sys.stderr)
-        return False
+REQUIRED_TOOLS = ["uvx", "python3", "git", "gh", "git-cliff", "uv"]
 
-    # Syntax check
-    syntax = run(["python3", "-m", "py_compile", str(script)], check=False)
-    if syntax.returncode != 0:
-        if syntax.stderr:
-            print(syntax.stderr, file=sys.stderr)
-        return False
 
-    return True
+def gate_tools() -> None:
+    step("0", "Tool availability")
+    missing = []
+    for tool in REQUIRED_TOOLS:
+        if shutil.which(tool) is None:
+            missing.append(tool)
+    if missing:
+        die(
+            f"missing required tools: {', '.join(missing)}",
+            hint=(
+                "install them before publishing. "
+                "git-cliff: cargo install git-cliff; "
+                "gh: brew install gh; "
+                "uv: curl -LsSf https://astral.sh/uv/install.sh | sh"
+            ),
+        )
+    ok("all required tools present")
 
+
+# ─────────────────────────────────────────────
+# GATE 1: pre-push hook installed
+# ─────────────────────────────────────────────
+
+
+def gate_pre_push_hook(repo_root: Path) -> None:
+    step("1", "Pre-push hook")
+    # .git may be a file (worktree) or directory (main). Use git rev-parse.
+    result = run_probe(["git", "rev-parse", "--git-path", "hooks/pre-push"])
+    if result.returncode != 0:
+        die("cannot resolve git hooks path")
+    hook_path = (repo_root / result.stdout.strip()).resolve()
+    if not hook_path.exists():
+        die(
+            f"pre-push hook missing at {hook_path}",
+            hint=f"run: ln -sf ../../scripts/pre-push {hook_path}",
+        )
+    # Check executable (symlink target must be executable)
+    real = hook_path.resolve()
+    if not os.access(real, os.X_OK):
+        die(
+            f"pre-push hook at {real} is not executable",
+            hint=f"run: chmod +x {real}",
+        )
+    ok(f"pre-push hook active at {hook_path}")
+
+
+# ─────────────────────────────────────────────
+# GATE 2: clean working tree
+# ─────────────────────────────────────────────
+
+
+def gate_clean_tree() -> None:
+    step("2", "Clean working tree")
+    if run_probe(["git", "diff", "--quiet"]).returncode != 0:
+        die("uncommitted changes found", hint="commit or stash first")
+    if run_probe(["git", "diff", "--cached", "--quiet"]).returncode != 0:
+        die("staged changes found", hint="commit or unstage first")
+    ok("working tree clean")
+
+
+# ─────────────────────────────────────────────
+# GATE 3: lint all Python files
+# ─────────────────────────────────────────────
+
+
+def _python_files(scripts_dir: Path) -> list[Path]:
+    return sorted(scripts_dir.glob("*.py"))
+
+
+def gate_lint(scripts_dir: Path) -> None:
+    step("3", "Lint (all Python files)")
+    py_files = _python_files(scripts_dir)
+    if not py_files:
+        die(f"no Python files found in {scripts_dir}")
+    paths = [str(p) for p in py_files]
+    print(f"  checking {len(py_files)} files: {', '.join(p.name for p in py_files)}")
+    # ruff check
+    r = run_probe(["uvx", "ruff", "check", *paths])
+    if r.returncode != 0:
+        print(r.stdout)
+        print(r.stderr, file=sys.stderr)
+        die("ruff check reported errors", hint="run: uvx ruff check --fix scripts/")
+    # ruff format --check
+    r = run_probe(["uvx", "ruff", "format", "--check", *paths])
+    if r.returncode != 0:
+        print(r.stdout)
+        print(r.stderr, file=sys.stderr)
+        die(
+            "ruff format reported unformatted files",
+            hint="run: uvx ruff format scripts/",
+        )
+    ok(f"ruff check + format clean on {len(py_files)} files")
+
+
+# ─────────────────────────────────────────────
+# GATE 4: type check (mypy)
+# ─────────────────────────────────────────────
+
+
+def gate_type_check(scripts_dir: Path) -> None:
+    step("4", "Type check (mypy)")
+    target = scripts_dir / "token-reporter.py"
+    if not target.exists():
+        die(f"{target} not found")
+    r = run_probe(
+        [
+            "uvx",
+            "--with",
+            "tiktoken",
+            "mypy",
+            "--ignore-missing-imports",
+            str(target),
+        ]
+    )
+    if r.returncode != 0:
+        print(r.stdout)
+        print(r.stderr, file=sys.stderr)
+        die("mypy reported type errors", hint="fix all type errors before publishing")
+    ok("mypy: 0 errors")
+
+
+# ─────────────────────────────────────────────
+# GATE 5: syntax check (all Python files)
+# ─────────────────────────────────────────────
+
+
+def gate_syntax(scripts_dir: Path) -> None:
+    step("5", "Syntax check (all Python files)")
+    py_files = _python_files(scripts_dir)
+    for f in py_files:
+        r = run_probe(["python3", "-m", "py_compile", str(f)])
+        if r.returncode != 0:
+            print(r.stderr, file=sys.stderr)
+            die(f"syntax error in {f.name}")
+    ok(f"syntax valid in {len(py_files)} files")
+
+
+# ─────────────────────────────────────────────
+# GATE 6: test suite
+# ─────────────────────────────────────────────
+
+
+def gate_tests(repo_root: Path) -> None:
+    step("6", "Test suite")
+    # Tests live in tests_dev/ at project root (one level above plugin repo root)
+    # This is gitignored in the plugin repo but present in the development tree.
+    test_candidates = [
+        repo_root / "tests_dev" / "test_v2185_parse.py",
+        repo_root.parent / "tests_dev" / "test_v2185_parse.py",
+    ]
+    test_file = next((p for p in test_candidates if p.exists()), None)
+    if test_file is None:
+        die(
+            "test file not found in any known location",
+            hint=(
+                "expected at one of: "
+                + "; ".join(str(p) for p in test_candidates)
+                + ". Tests are mandatory — do not delete them."
+            ),
+        )
+    print(f"  running {test_file}")
+    # Use uv run with tiktoken so tokenization matches production
+    r = run_probe(["uv", "run", "--with", "tiktoken", "python3", str(test_file)])
+    # Stream test output (it has the unicode table)
+    if r.stdout:
+        # Show the summary line at minimum
+        for line in r.stdout.splitlines()[-5:]:
+            print(f"  {line}")
+    if r.returncode != 0:
+        print(r.stdout)
+        print(r.stderr, file=sys.stderr)
+        die("test suite has failures", hint="all tests must pass before publishing")
+    # Parse "N passed, M failed / T total"
+    match_tests = re.search(r"(\d+)\s*passed.*?(\d+)\s*failed", r.stdout, re.DOTALL)
+    if match_tests is None:
+        die(
+            "cannot parse test summary",
+            hint="test output format changed — update publish.py",
+        )
+    passed = int(match_tests.group(1))
+    failed = int(match_tests.group(2))
+    if failed > 0:
+        die(f"{failed} tests failed (only {passed} passed)")
+    if passed == 0:
+        die("0 tests ran — test file may be empty or broken")
+    ok(f"all {passed} tests passed")
+
+
+# ─────────────────────────────────────────────
+# GATE 7: CPV validation (strict)
+# ─────────────────────────────────────────────
 
 CPV_REPO = "git+https://github.com/Emasoft/claude-plugins-validation"
 
 
-def run_cpv_validation(repo_root: Path) -> bool:
-    """Run CPV plugin validation via remote execution. Return True if ALL pass.
+def _issue_path(line: str) -> str:
+    """Extract the trailing (path[:line]) marker from a CPV issue line.
 
-    Uses uvx to run the validator directly from the GitHub repo — no local
-    scripts to sync. This is the authoritative validation gate: if CPV reports
-    ANY issue (CRITICAL, MAJOR, MINOR, or WARNING), the plugin must NOT be
-    pushed to GitHub. Fix all issues before publishing.
+    CPV issue lines look like:
+        [CRITICAL] message here (path/to/file.py):42
+        [WARNING] message here (~/.claude/settings.local.json)
+    Returns the raw path string, or "" if no path marker is found.
     """
-    result = run(
+    # Last parenthesised group on the line is the path marker.
+    m = re.search(r"\(([^()]+)\)(?::\d+)?\s*$", line)
+    return m.group(1).strip() if m else ""
+
+
+def _path_inside(path_str: str, repo_root: Path) -> bool:
+    """True if path_str refers to a file inside repo_root.
+
+    CPV uses relative paths for plugin files and ~-prefixed or /-prefixed
+    absolute paths for global issues. Only files inside the plugin count
+    against the release gate.
+    """
+    if not path_str:
+        # No path at all — structural issue, counts as inside the plugin.
+        return True
+    # Absolute or home-relative paths are outside the plugin tree.
+    if path_str.startswith(("~", "/")):
+        try:
+            p = Path(path_str).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return False
+        try:
+            p.relative_to(repo_root.resolve())
+            return True
+        except ValueError:
+            return False
+    # Relative path: assume inside plugin (CPV reports them from repo_root).
+    return True
+
+
+def gate_cpv(repo_root: Path, *, label: str = "CPV validation") -> None:
+    step("7", label)
+    # cpv-remote-validate is the environment isolation launcher that wraps
+    # the individual validators to prevent the target's local config files
+    # (ruff.toml, pyproject.toml, etc.) from interfering with the validator's
+    # own tools. This is the REQUIRED entry point when running CPV via uvx.
+    r = run_probe(
         [
             "uvx",
-            "--from", CPV_REPO,
-            "--with", "pyyaml",
-            "cpv-validate",
+            "--from",
+            CPV_REPO,
+            "--with",
+            "pyyaml",
+            "cpv-remote-validate",
+            "plugin",
             str(repo_root),
-        ],
-        check=False,
+        ]
     )
-    if result.stdout:
-        print(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
-    return result.returncode == 0
+    output = (r.stdout or "") + "\n" + (r.stderr or "")
+    # Show last 15 lines of output for context
+    for line in output.strip().splitlines()[-15:]:
+        print(f"  {line}")
+    if r.returncode != 0:
+        die(f"cpv-validate exited with code {r.returncode}")
+
+    # Count issues that refer to files inside the plugin.
+    # Issues about global config files (e.g. ~/.claude/settings.local.json)
+    # are reported but do not block the release — they are environment
+    # problems, not plugin defects.
+    counts = {"CRITICAL": 0, "MAJOR": 0, "MINOR": 0, "NIT": 0, "WARNING": 0}
+    ignored = 0
+    issue_re = re.compile(r"^\s*\[(CRITICAL|MAJOR|MINOR|NIT|WARNING)\]")
+    for line in output.splitlines():
+        m = issue_re.match(line)
+        if not m:
+            continue
+        severity = m.group(1)
+        path_str = _issue_path(line)
+        if _path_inside(path_str, repo_root):
+            counts[severity] += 1
+        else:
+            ignored += 1
+
+    total = sum(counts.values())
+    if ignored:
+        print(f"  (ignored {ignored} issue(s) about files outside the plugin)")
+    if total > 0:
+        breakdown = " ".join(f"{k.lower()}={v}" for k, v in counts.items())
+        die(
+            f"CPV found {total} plugin issues ({breakdown})",
+            hint="fix every single plugin issue before publishing — NO EXCEPTIONS",
+        )
+    ok("CPV: 0 plugin issues across all severity levels")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Publish a new release")
+# ─────────────────────────────────────────────
+# Version management
+# ─────────────────────────────────────────────
+
+
+def read_plugin_version(plugin_json: Path) -> str:
+    if not plugin_json.exists():
+        die(f"{plugin_json} not found — is this a claude-plugin repo?")
+    return json.loads(plugin_json.read_text(encoding="utf-8")).get("version", "0.0.0")
+
+
+def write_plugin_version(plugin_json: Path, new_version: str) -> None:
+    manifest = json.loads(plugin_json.read_text(encoding="utf-8"))
+    manifest["version"] = new_version
+    plugin_json.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def write_pyproject_version(pyproject: Path, new_version: str) -> None:
+    if not pyproject.exists():
+        die(f"{pyproject} not found — pyproject.toml is required")
+    content = pyproject.read_text(encoding="utf-8")
+    new_content, n = re.subn(
+        r'^version\s*=\s*"[^"]*"',
+        f'version = "{new_version}"',
+        content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if n != 1:
+        die(
+            f"could not find 'version = ...' line in {pyproject}",
+            hint="pyproject.toml must have a top-level [project] version field",
+        )
+    pyproject.write_text(new_content, encoding="utf-8")
+
+
+def verify_versions_match(plugin_json: Path, pyproject: Path, expected: str) -> None:
+    """Verify plugin.json and pyproject.toml both contain the expected version."""
+    pj_version = json.loads(plugin_json.read_text(encoding="utf-8")).get("version")
+    if pj_version != expected:
+        die(f"plugin.json version {pj_version!r} != expected {expected!r}")
+    py_content = pyproject.read_text(encoding="utf-8")
+    m = re.search(r'^version\s*=\s*"([^"]+)"', py_content, re.MULTILINE)
+    if not m or m.group(1) != expected:
+        actual = m.group(1) if m else "<not found>"
+        die(f"pyproject.toml version {actual!r} != expected {expected!r}")
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Publish a new release (all quality gates mandatory)",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--patch", action="store_true", help="Bump patch version (default)"
@@ -129,66 +485,46 @@ def main():
     group.add_argument("--minor", action="store_true", help="Bump minor version")
     group.add_argument("--major", action="store_true", help="Bump major version")
     group.add_argument(
-        "--set", type=str, metavar="VERSION", help="Set explicit version (x.y.z)"
+        "--set",
+        type=str,
+        metavar="VERSION",
+        help="Set explicit version (x.y.z)",
     )
     parser.add_argument(
-        "--dry-run", "-n", action="store_true", help="Preview without making changes"
+        "--dry-run",
+        "-n",
+        action="store_true",
+        help="Run ALL checks but skip commit/tag/push/release",
     )
     args = parser.parse_args()
 
-    # Resolve paths from script location
     repo_root = Path(__file__).resolve().parent.parent
+    scripts_dir = repo_root / "scripts"
     plugin_json = repo_root / ".claude-plugin" / "plugin.json"
+    pyproject = repo_root / "pyproject.toml"
     changelog = repo_root / "CHANGELOG.md"
 
-    # ── 0. Verify clean working tree ──
-    print("\n── 0. Verify clean working tree ──")
-    result = run(["git", "diff", "--quiet"], check=False, capture=False)
-    if result.returncode != 0:
-        print(
-            "ERROR: uncommitted changes found. Commit or stash first.", file=sys.stderr
-        )
-        sys.exit(1)
-    result = run(["git", "diff", "--cached", "--quiet"], check=False, capture=False)
-    if result.returncode != 0:
-        print("ERROR: staged changes found. Commit or stash first.", file=sys.stderr)
-        sys.exit(1)
-    print("OK: working tree clean\n")
+    print("\n" + "=" * 64)
+    print("  token-reporter release pipeline")
+    print("  ALL QUALITY GATES ARE MANDATORY — NO SKIPS, NO EXCEPTIONS")
+    print("=" * 64)
 
-    # ── 1. Run checks (before any file modifications) ──
-    print("── 1. Run checks ──")
-    if not run_checks(repo_root):
-        print("ERROR: checks failed. Fix issues before publishing.", file=sys.stderr)
-        sys.exit(1)
-    print("  lint: passing | syntax: valid")
-    print()
+    # ── MANDATORY QUALITY GATES ──
+    gate_tools()
+    gate_pre_push_hook(repo_root)
+    gate_clean_tree()
+    gate_lint(scripts_dir)
+    gate_type_check(scripts_dir)
+    gate_syntax(scripts_dir)
+    gate_tests(repo_root)
+    gate_cpv(repo_root, label="CPV validation (pre-bump)")
 
-    # ── 1b. CPV plugin validation (remote, authoritative gate) ──
-    print("── 1b. CPV plugin validation ──")
-    if not run_cpv_validation(repo_root):
-        print(
-            "ERROR: CPV validation failed. Fix issues before publishing.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    print("  CPV: all checks passed")
-    print()
-
-    # ── 2. Bump version ──
-    print("── 2. Bump version ──")
-    if not plugin_json.exists():
-        print(
-            f"ERROR: {plugin_json} not found — is this a claude-plugin repo?",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    manifest = json.loads(plugin_json.read_text(encoding="utf-8"))
-    current = manifest.get("version", "0.0.0")
-
+    # All pre-bump gates passed. Compute new version.
+    step("8", "Version bump")
+    current = read_plugin_version(plugin_json)
     if args.set:
         if not re.match(r"^\d+\.\d+\.\d+$", args.set):
-            print(f"ERROR: '{args.set}' is not valid semver (x.y.z)", file=sys.stderr)
-            sys.exit(1)
+            die(f"'{args.set}' is not valid semver (x.y.z)")
         new_version = args.set
     elif args.major:
         new_version = bump_version(current, "major")
@@ -198,70 +534,79 @@ def main():
         new_version = bump_version(current, "patch")
 
     if new_version == current:
-        print(f"Version unchanged: {current}. Nothing to publish.")
-        return
+        die(
+            f"version unchanged ({current}) — nothing to publish",
+            hint="use --patch/--minor/--major or --set to bump",
+        )
 
     tag = f"v{new_version}"
-
-    # Verify tag does not already exist
-    tag_check = run(["git", "tag", "--list", tag], check=False)
-    if tag_check.stdout and tag_check.stdout.strip() == tag:
-        print(f"ERROR: tag '{tag}' already exists", file=sys.stderr)
-        sys.exit(1)
+    tag_check = run_probe(["git", "tag", "--list", tag])
+    if tag_check.stdout.strip() == tag:
+        die(f"tag {tag} already exists")
 
     print(f"  {current} -> {new_version} (tag: {tag})")
 
     if args.dry_run:
-        print(
-            "\n[DRY RUN] Would update plugin.json, CHANGELOG.md"
-        )
-        print(f"[DRY RUN] Would commit, tag {tag}, push, and create GitHub release")
+        print(f"\n[DRY RUN] All quality gates passed. Would release {tag}.")
         return
 
-    # Update plugin.json
-    manifest["version"] = new_version
-    plugin_json.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    print()
+    # Update plugin.json AND pyproject.toml atomically
+    write_plugin_version(plugin_json, new_version)
+    write_pyproject_version(pyproject, new_version)
+    verify_versions_match(plugin_json, pyproject, new_version)
+    ok(f"plugin.json and pyproject.toml updated to {new_version}")
 
-    # ── 3. Update CHANGELOG.md with git-cliff ──
-    print("── 3. Update changelog ──")
-    if shutil.which("git-cliff"):
-        run(["git-cliff", "--tag", tag, "--output", str(changelog)], capture=False)
-    else:
-        print("  git-cliff not found, skipping changelog generation")
-    print()
+    # ── GATE 9: re-validate after version bump ──
+    gate_cpv(repo_root, label="CPV validation (post-bump)")
 
-    # ── 4. Commit ──
-    print("── 4. Commit ──")
-    files_to_stage = [str(plugin_json)]
-    if changelog.exists():
-        files_to_stage.append(str(changelog))
-    run(["git", "add"] + files_to_stage, capture=False)
-    run(["git", "commit", "-m", f"Release {tag}"], capture=False)
-    print()
+    # ── GATE 10: changelog (mandatory) ──
+    step("10", "Changelog regeneration (git-cliff)")
+    run_strict(["git-cliff", "--tag", tag, "--output", str(changelog)])
+    if not changelog.exists():
+        die("git-cliff did not produce CHANGELOG.md")
+    ok(f"CHANGELOG.md regenerated for {tag}")
 
-    # ── 5. Tag ──
-    print("── 5. Tag ──")
-    run(["git", "tag", "-a", tag, "-m", f"Release {tag}"], capture=False)
-    print()
+    # ── STEP 11: commit ──
+    step("11", "Commit")
+    run_strict(["git", "add", str(plugin_json), str(pyproject), str(changelog)])
+    run_strict(["git", "commit", "-m", f"Release {tag}"])
+    # Verify the commit exists (HEAD message matches)
+    head_msg = run_probe(["git", "log", "-1", "--pretty=%s"]).stdout.strip()
+    if head_msg != f"Release {tag}":
+        die(f"commit verification failed: HEAD message is {head_msg!r}")
+    ok("commit created and verified")
 
-    # ── 6. Push (pre-push hook runs validation) ──
-    print("── 6. Push ──")
-    run(["git", "push", "--follow-tags"], capture=False)
-    print()
+    # ── STEP 12: tag ──
+    step("12", "Annotated tag")
+    run_strict(["git", "tag", "-a", tag, "-m", f"Release {tag}"])
+    tag_verify = run_probe(["git", "tag", "--list", tag])
+    if tag_verify.stdout.strip() != tag:
+        die(f"tag {tag} was not created")
+    ok(f"tag {tag} created and verified")
 
-    # ── 7. GitHub release ──
-    print("── 7. Create GitHub release ──")
+    # ── STEP 13: push ──
+    step("13", "Push (pre-push hook runs as another gate)")
+    # Never use --no-verify. The pre-push hook is an additional enforcement layer.
+    run_strict(["git", "push", "--follow-tags"])
+    # Verify the remote tag exists
+    ls_remote = run_probe(["git", "ls-remote", "--tags", "origin", tag])
+    if tag not in ls_remote.stdout:
+        die(f"tag {tag} was not pushed to origin")
+    ok(f"commit and tag {tag} pushed to origin")
+
+    # ── STEP 14: GitHub release ──
+    step("14", "GitHub release")
     notes = extract_release_notes(changelog, new_version)
-    run(
+    run_strict(
         ["gh", "release", "create", tag, "--title", tag, "--notes", notes],
-        capture=False,
     )
+    # Verify the release exists
+    gh_view = run_probe(["gh", "release", "view", tag])
+    if gh_view.returncode != 0:
+        die(f"GitHub release {tag} was not created")
+    ok(f"GitHub release {tag} created and verified")
 
-    print(f"\nPublished {tag}")
+    print(f"\n\033[92m✓ Published {tag}\033[0m")
 
 
 if __name__ == "__main__":
