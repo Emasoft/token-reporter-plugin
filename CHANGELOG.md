@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 2026-04-10
+
+
+### Features
+
+- Pre-push hook refuses direct pushes to main (publish.py gate)
+
 ## [1.4.0] - 2026-04-10
 
 
