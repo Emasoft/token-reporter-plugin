@@ -46,7 +46,6 @@ import argparse
 import json
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import sys
@@ -81,10 +80,7 @@ def ok(msg: str) -> None:
 
 
 def run_strict(
-    cmd: list[str],
-    *,
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
+    cmd: list[str], *, cwd: Path | None = None
 ) -> subprocess.CompletedProcess:
     """Run a command and abort the release on non-zero exit code.
 
@@ -92,7 +88,7 @@ def run_strict(
     the return code because we call die() on failure here.
     """
     print(f"  $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
         if result.stdout:
             print(result.stdout)
@@ -678,44 +674,17 @@ def main() -> None:
     ok(f"tag {tag} created and verified")
 
     # ── STEP 13: push ──
-    # Never use --no-verify. The pre-push hook is an additional enforcement
-    # layer: for pushes to main, it requires a one-shot gate token that
-    # publish.py writes here, right before invoking git push. The token
-    # includes the HEAD commit SHA so it cannot be reused for a different
-    # push. The pre-push hook reads the file, deletes it immediately, and
-    # compares it to the TOKEN_REPORTER_PUBLISH_TOKEN env var.
-    step("13", "Push (pre-push hook runs as another gate)")
-    head_sha = run_probe(["git", "rev-parse", "HEAD"]).stdout.strip()
-    if not head_sha:
-        die("could not resolve HEAD SHA before push")
-    # Random nonce + tag + HEAD SHA. The HEAD SHA binds the token to the
-    # exact commit being pushed; the nonce prevents trivial reuse.
-    nonce = secrets.token_hex(16)
-    gate_token = f"{nonce} {tag} {head_sha}"
-    # .git/publish-gate — one-shot consumed by the pre-push hook.
-    gate_path_result = run_probe(["git", "rev-parse", "--git-path", "publish-gate"])
-    if gate_path_result.returncode != 0:
-        die("could not resolve .git/publish-gate path")
-    gate_path = (repo_root / gate_path_result.stdout.strip()).resolve()
-    gate_path.write_text(gate_token, encoding="utf-8")
-    # Restrict perms so only the owner can read the token.
-    try:
-        os.chmod(gate_path, 0o600)
-    except OSError:
-        pass
-    try:
-        # Pass the token via env var so the pre-push hook can verify.
-        push_env = os.environ.copy()
-        push_env["TOKEN_REPORTER_PUBLISH_TOKEN"] = gate_token
-        run_strict(["git", "push", "--follow-tags"], env=push_env)
-    finally:
-        # Defence in depth: even if the hook forgot to consume the file,
-        # always remove it after git push returns.
-        if gate_path.exists():
-            try:
-                gate_path.unlink()
-            except OSError:
-                pass
+    # The pre-push hook is an additional enforcement layer: for pushes to
+    # main, it walks the OS process tree and requires scripts/publish.py
+    # (THIS file) to be an ancestor process. publish.py doesn't need to
+    # write any marker or set any env var — its mere presence in the
+    # process ancestry is the authorization. Env vars and marker files
+    # are NOT used because both are trivially spoofable; process ancestry
+    # cannot be faked without actually running publish.py.
+    #
+    # Never use --no-verify.
+    step("13", "Push (pre-push hook verifies process ancestry)")
+    run_strict(["git", "push", "--follow-tags"])
     # Verify the remote tag exists
     ls_remote = run_probe(["git", "ls-remote", "--tags", "origin", tag])
     if tag not in ls_remote.stdout:

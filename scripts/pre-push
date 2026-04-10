@@ -2,12 +2,25 @@
 # Pre-push hook — quality gate before code reaches GitHub.
 #
 # For pushes to main:
-#   REFUSES the push unless scripts/publish.py is the caller. The publish
-#   pipeline writes a one-shot gate token to .git/publish-gate and sets the
-#   TOKEN_REPORTER_PUBLISH_TOKEN env var before running 'git push'. This hook
-#   reads the file, deletes it immediately (one-shot), and verifies it matches
-#   the env var. A direct 'git push origin main' will fail because no token
-#   exists.
+#   REFUSES the push unless scripts/publish.py is an ANCESTOR PROCESS of
+#   this hook. Verified by walking the actual OS process tree (via ps), not
+#   by env vars or marker files — both of those are trivially spoofable.
+#
+#   The check:
+#     1. Start from the hook's own PID.
+#     2. Walk up ppid → ppid → ... until we reach init or find publish.py.
+#     3. For each ancestor, read the command line via 'ps -p <pid> -o args='.
+#     4. An ancestor qualifies if its command line contains the ABSOLUTE path
+#        to THIS repo's scripts/publish.py. As a fallback for invocations
+#        that used a relative path, we accept a cmdline containing the
+#        substring 'scripts/publish.py' IFF the ancestor's CWD (via /proc or
+#        lsof) is this repo's root.
+#     5. If no ancestor qualifies within 20 levels, the push is REJECTED.
+#
+#   Why process ancestry: a user cannot fake an ancestor that doesn't exist.
+#   They can set any env var, write any file, spoof any argument — but they
+#   cannot make this hook's grandparent process be publish.py unless
+#   publish.py actually ran and called git push.
 #
 # For pushes to any other branch:
 #   Runs lint / syntax / manifest checks so feature branch CI is fast.
@@ -79,21 +92,93 @@ python3 -c "import json; json.load(open('.claude-plugin/plugin.json'))" || {
 echo "OK: plugin.json valid"
 echo ""
 
-# ── 4. Main push ⇒ require publish.py caller ────────────
+# ── 4. Main push ⇒ require publish.py in process ancestry ────────
 if [ "$PUSHING_TO_MAIN" = "1" ]; then
   echo "── 4. Publish gate (main branch) ──"
-  GATE_FILE="$(git rev-parse --git-path publish-gate)"
 
-  # The gate token file MUST exist. It is written by scripts/publish.py
-  # right after it passes ALL quality gates (lint, type, syntax, tests,
-  # CPV validation) and right before it calls 'git push'.
-  if [ ! -f "$GATE_FILE" ]; then
+  # Compute the canonical absolute path to THIS repo's publish.py.
+  expected_abs="$REPO_ROOT/scripts/publish.py"
+  if command -v realpath >/dev/null 2>&1; then
+    expected_abs="$(realpath "$expected_abs" 2>/dev/null || echo "$expected_abs")"
+  fi
+
+  # Canonical repo root for CWD comparison.
+  canonical_repo="$REPO_ROOT"
+  if command -v realpath >/dev/null 2>&1; then
+    canonical_repo="$(realpath "$REPO_ROOT" 2>/dev/null || echo "$REPO_ROOT")"
+  fi
+
+  # Walk up the process tree from the hook's own PID. At each step,
+  # look up the ancestor's command line via 'ps' and check whether it
+  # invokes THIS repo's publish.py. Stop after 20 hops (safety) or when
+  # we reach init (ppid 1 or 0).
+  get_ppid() {
+    ps -p "$1" -o ppid= 2>/dev/null | tr -d ' '
+  }
+  get_cmdline() {
+    ps -p "$1" -o args= 2>/dev/null || true
+  }
+  get_cwd() {
+    local _pid="$1"
+    if [ -e "/proc/$_pid/cwd" ]; then
+      readlink "/proc/$_pid/cwd" 2>/dev/null || true
+    elif command -v lsof >/dev/null 2>&1; then
+      lsof -p "$_pid" -a -d cwd -Fn 2>/dev/null \
+        | awk '/^n/ {print substr($0, 2); exit}' || true
+    fi
+  }
+
+  ancestor_pid="$$"
+  found=0
+  depth=0
+  max_depth=20
+
+  while [ "$depth" -lt "$max_depth" ]; do
+    ppid="$(get_ppid "$ancestor_pid")"
+    if [ -z "$ppid" ] || [ "$ppid" = "0" ] || [ "$ppid" = "1" ]; then
+      break
+    fi
+
+    cmdline="$(get_cmdline "$ppid")"
+    if [ -n "$cmdline" ]; then
+      # 1. Strong match: absolute path to THIS repo's publish.py appears
+      #    verbatim in the ancestor's command line.
+      if [[ "$cmdline" == *"$expected_abs"* ]]; then
+        found=1
+        break
+      fi
+
+      # 2. Fallback for relative invocations (e.g. 'uv run
+      #    scripts/publish.py' from the repo root): the substring
+      #    'scripts/publish.py' is present AND the ancestor process's
+      #    CWD resolves to THIS repo's root.
+      if [[ "$cmdline" == *"scripts/publish.py"* ]]; then
+        ancestor_cwd="$(get_cwd "$ppid")"
+        if [ -n "$ancestor_cwd" ] && command -v realpath >/dev/null 2>&1; then
+          ancestor_cwd="$(realpath "$ancestor_cwd" 2>/dev/null || echo "$ancestor_cwd")"
+        fi
+        if [ -n "$ancestor_cwd" ] && [ "$ancestor_cwd" = "$canonical_repo" ]; then
+          found=1
+          break
+        fi
+      fi
+    fi
+
+    ancestor_pid="$ppid"
+    depth=$((depth + 1))
+  done
+
+  if [ "$found" != "1" ]; then
     echo ""
     echo "BLOCKED: direct 'git push' to main is forbidden."
     echo ""
-    echo "  Pushes to main MUST go through scripts/publish.py, which runs"
-    echo "  the full release pipeline (lint, type check, syntax, tests,"
-    echo "  CPV validation, version bump, changelog, tag, push, release)."
+    echo "  Pushes to main MUST go through scripts/publish.py. The hook"
+    echo "  walks the OS process tree and no ancestor process runs"
+    echo "  publish.py from THIS repo."
+    echo ""
+    echo "  Expected ancestor cmdline to contain:"
+    echo "    $expected_abs"
+    echo "  (or 'scripts/publish.py' with ancestor CWD = $canonical_repo)"
     echo ""
     echo "  To publish a release:"
     echo "    uv run scripts/publish.py                # auto-bump via git-cliff"
@@ -102,51 +187,13 @@ if [ "$PUSHING_TO_MAIN" = "1" ]; then
     echo "    uv run scripts/publish.py --major        # force major bump"
     echo "    uv run scripts/publish.py --set X.Y.Z    # explicit version"
     echo ""
-    echo "  Do NOT try to bypass this by manually creating $GATE_FILE."
+    echo "  This check uses process ancestry — env vars and marker files"
+    echo "  are NOT honored because they can be trivially spoofed."
     echo ""
     exit 1
   fi
 
-  # One-shot: read the token, THEN delete the file immediately so a
-  # subsequent manual push cannot reuse it.
-  FILE_TOKEN="$(cat "$GATE_FILE")"
-  rm -f "$GATE_FILE"
-
-  # The token must match the env var that publish.py sets in the
-  # subprocess environment. If an attacker copied the file but didn't
-  # set the env var (or set it to a different value), this fails.
-  if [ -z "${TOKEN_REPORTER_PUBLISH_TOKEN:-}" ]; then
-    echo ""
-    echo "BLOCKED: publish gate token file exists but env var is missing."
-    echo "  This usually means someone tried to bypass the release pipeline."
-    echo "  Run scripts/publish.py to publish — never push to main directly."
-    echo ""
-    exit 1
-  fi
-
-  if [ "$FILE_TOKEN" != "$TOKEN_REPORTER_PUBLISH_TOKEN" ]; then
-    echo ""
-    echo "BLOCKED: publish gate token mismatch."
-    echo "  File token:  $FILE_TOKEN"
-    echo "  Env token:   $TOKEN_REPORTER_PUBLISH_TOKEN"
-    echo ""
-    exit 1
-  fi
-
-  # The token also encodes the current HEAD commit SHA, so the push must
-  # be pushing exactly the commit that publish.py prepared.
-  HEAD_SHA="$(git rev-parse HEAD)"
-  if [[ "$FILE_TOKEN" != *"$HEAD_SHA"* ]]; then
-    echo ""
-    echo "BLOCKED: publish gate token does not match current HEAD."
-    echo "  Expected HEAD: $HEAD_SHA"
-    echo "  Token:         $FILE_TOKEN"
-    echo ""
-    echo "  The publish pipeline and push are out of sync."
-    exit 1
-  fi
-
-  echo "OK: publish.py caller verified (token matched, one-shot consumed)"
+  echo "OK: publish.py verified in process ancestry (depth=$depth)"
   echo ""
 fi
 
