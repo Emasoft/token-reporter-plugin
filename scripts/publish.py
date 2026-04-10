@@ -2,14 +2,25 @@
 """Publish a new release with mandatory quality gates.
 
 Usage:
-    uv run scripts/publish.py              # bump patch (default)
-    uv run scripts/publish.py --patch      # 1.1.0 -> 1.1.1
-    uv run scripts/publish.py --minor      # 1.1.0 -> 1.2.0
-    uv run scripts/publish.py --major      # 1.1.0 -> 2.0.0
+    uv run scripts/publish.py              # auto-bump via git-cliff (default)
+    uv run scripts/publish.py --patch      # force patch bump
+    uv run scripts/publish.py --minor      # force minor bump
+    uv run scripts/publish.py --major      # force major bump
     uv run scripts/publish.py --set 2.0.0  # explicit version
     uv run scripts/publish.py --dry-run    # preview — still runs all checks
 
-MANDATORY QUALITY GATES (in order, all unskippable, all must return 0 errors):
+WORKFLOW (strict order):
+    1. Lint / test / validate (gates 0–7, no file modifications)
+    2. Compute next version (git-cliff --bumped-version from conventional commits)
+    3. Update plugin.json + pyproject.toml
+    4. Re-validate with CPV
+    5. Regenerate CHANGELOG.md via git-cliff
+    6. Commit "chore(release): vX.Y.Z"
+    7. Create annotated tag
+    8. Push commits + tags
+    9. Create GitHub release with notes extracted from CHANGELOG.md
+
+MANDATORY QUALITY GATES (all unskippable, all must return 0 errors):
     0.  Tool availability:    uvx, python3, git, gh, git-cliff, uv all installed
     1.  Pre-push hook:        .git/hooks/pre-push exists and is executable
     2.  Clean working tree:   no uncommitted or staged changes
@@ -21,10 +32,10 @@ MANDATORY QUALITY GATES (in order, all unskippable, all must return 0 errors):
     8.  Version bump:         plugin.json AND pyproject.toml updated atomically
     9.  CPV re-validation:    post-bump verification
     10. Changelog:            git-cliff regenerates CHANGELOG.md (MANDATORY)
-    11. Commit:               version + changelog, verified afterwards
+    11. Commit:               chore(release) format, verified afterwards
     12. Tag:                  annotated tag, verified to exist
     13. Push:                 git push --follow-tags (pre-push hook is another gate)
-    14. GitHub release:       gh release create, verified to exist
+    14. GitHub release:       gh release create with notes from CHANGELOG.md
 
 NO EXCEPTIONS. NO SKIPS. Any failure at ANY step aborts the release.
 """
@@ -113,14 +124,72 @@ def bump_version(current: str, part: str) -> str:
 
 
 def extract_release_notes(changelog_path: Path, version: str) -> str:
+    """Extract the section for a specific version from CHANGELOG.md.
+
+    Matches the section between ``## [version]`` and the next ``## [`` header
+    or end of file. The ``version`` argument is the bare semver (no ``v`` prefix)
+    because git-cliff strips the prefix in section headers via trim_start_matches.
+    """
     if not changelog_path.exists():
-        return f"Release v{version}"
+        die(f"CHANGELOG.md not found at {changelog_path}")
     content = changelog_path.read_text(encoding="utf-8")
-    pattern = rf"^## \[{re.escape(version)}\].*?\n(.*?)(?=^## \[|\Z)"
-    match = re.search(pattern, content, re.MULTILINE | re.DOTALL)
-    if not match:
-        return f"Release v{version}"
-    return match.group(1).strip()
+    # Match: ## [1.3.2] - 2026-04-11\n ... (until next ## [ or EOF)
+    pattern = rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)"
+    m = re.search(pattern, content, re.MULTILINE | re.DOTALL)
+    if m is None:
+        die(
+            f"could not find section for version {version} in {changelog_path}",
+            hint="cliff.toml template may be broken or version mismatch",
+        )
+    notes = m.group(1).strip()
+    if not notes:
+        die(f"section for version {version} is empty in {changelog_path}")
+    return notes
+
+
+def compute_next_version(current: str, args: argparse.Namespace) -> str:
+    """Determine the next release version.
+
+    Priority (highest first):
+        1. --set VERSION:   explicit version override
+        2. --major/--minor/--patch:  manual bump level
+        3. default:  git-cliff --bumped-version (auto-compute from commits)
+
+    Returns a bare semver string (no 'v' prefix).
+    """
+    if args.set:
+        if not re.match(r"^\d+\.\d+\.\d+$", args.set):
+            die(f"'{args.set}' is not valid semver (x.y.z)")
+        return args.set
+    if args.major:
+        return bump_version(current, "major")
+    if args.minor:
+        return bump_version(current, "minor")
+    if args.patch:
+        return bump_version(current, "patch")
+    # Default: delegate to git-cliff based on conventional commits.
+    r = run_probe(["git-cliff", "--bumped-version"])
+    if r.returncode != 0:
+        die(
+            "git-cliff --bumped-version failed",
+            hint=(
+                "check that conventional commit parsers are configured "
+                "in cliff.toml, or use --patch/--minor/--major explicitly"
+            ),
+        )
+    bumped = r.stdout.strip()
+    if not bumped:
+        die(
+            "git-cliff returned no bumped version",
+            hint=(
+                "no releasable changes detected. Either nothing committed "
+                "since the last tag, or no commits match a parser rule. "
+                "Use --patch/--minor/--major to force a bump."
+            ),
+        )
+    # git-cliff returns tags with the 'v' prefix (matching tag_pattern).
+    # Strip it to get the bare semver for plugin.json / pyproject.toml.
+    return bumped.lstrip("v")
 
 
 # ─────────────────────────────────────────────
@@ -480,10 +549,20 @@ def main() -> None:
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
-        "--patch", action="store_true", help="Bump patch version (default)"
+        "--patch",
+        action="store_true",
+        help="Force patch bump (override git-cliff auto)",
     )
-    group.add_argument("--minor", action="store_true", help="Bump minor version")
-    group.add_argument("--major", action="store_true", help="Bump major version")
+    group.add_argument(
+        "--minor",
+        action="store_true",
+        help="Force minor bump (override git-cliff auto)",
+    )
+    group.add_argument(
+        "--major",
+        action="store_true",
+        help="Force major bump (override git-cliff auto)",
+    )
     group.add_argument(
         "--set",
         type=str,
@@ -522,21 +601,16 @@ def main() -> None:
     # All pre-bump gates passed. Compute new version.
     step("8", "Version bump")
     current = read_plugin_version(plugin_json)
-    if args.set:
-        if not re.match(r"^\d+\.\d+\.\d+$", args.set):
-            die(f"'{args.set}' is not valid semver (x.y.z)")
-        new_version = args.set
-    elif args.major:
-        new_version = bump_version(current, "major")
-    elif args.minor:
-        new_version = bump_version(current, "minor")
-    else:
-        new_version = bump_version(current, "patch")
+    new_version = compute_next_version(current, args)
 
     if new_version == current:
         die(
             f"version unchanged ({current}) — nothing to publish",
-            hint="use --patch/--minor/--major or --set to bump",
+            hint=(
+                "no releasable changes detected by git-cliff. "
+                "Either nothing committed since last tag, or force with "
+                "--patch/--minor/--major/--set"
+            ),
         )
 
     tag = f"v{new_version}"
@@ -560,19 +634,34 @@ def main() -> None:
     gate_cpv(repo_root, label="CPV validation (post-bump)")
 
     # ── GATE 10: changelog (mandatory) ──
+    # Use git-cliff to regenerate CHANGELOG.md with the new release section.
+    # The --tag flag stamps unreleased commits with the target version, and
+    # our cliff.toml template renders a ``## [version] - date`` header plus
+    # grouped entries (Features, Bug Fixes, etc.) for each release.
     step("10", "Changelog regeneration (git-cliff)")
     run_strict(["git-cliff", "--tag", tag, "--output", str(changelog)])
     if not changelog.exists():
         die("git-cliff did not produce CHANGELOG.md")
-    ok(f"CHANGELOG.md regenerated for {tag}")
+    # Verify the new section is actually present in the output
+    new_section_header = f"## [{new_version}]"
+    if new_section_header not in changelog.read_text(encoding="utf-8"):
+        die(
+            f"CHANGELOG.md does not contain expected header {new_section_header!r}",
+            hint="check cliff.toml template — version header may be missing",
+        )
+    ok(f"CHANGELOG.md regenerated with {new_section_header}")
 
     # ── STEP 11: commit ──
+    # Use conventional-commit format so the cliff.toml parser SKIPS this
+    # commit in future changelogs (see {message = "^chore\\(release\\)",
+    # skip = true}). Otherwise every release would pollute the next one.
     step("11", "Commit")
+    commit_msg = f"chore(release): {tag}"
     run_strict(["git", "add", str(plugin_json), str(pyproject), str(changelog)])
-    run_strict(["git", "commit", "-m", f"Release {tag}"])
+    run_strict(["git", "commit", "-m", commit_msg])
     # Verify the commit exists (HEAD message matches)
     head_msg = run_probe(["git", "log", "-1", "--pretty=%s"]).stdout.strip()
-    if head_msg != f"Release {tag}":
+    if head_msg != commit_msg:
         die(f"commit verification failed: HEAD message is {head_msg!r}")
     ok("commit created and verified")
 
