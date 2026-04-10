@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # Pre-push hook — quality gate before code reaches GitHub.
-# Blocks the push if there are uncommitted changes or lint errors.
-# Does NOT modify the repo — no commits, no version bumps, no tags.
+#
+# For pushes to main:
+#   REFUSES the push unless scripts/publish.py is the caller. The publish
+#   pipeline writes a one-shot gate token to .git/publish-gate and sets the
+#   TOKEN_REPORTER_PUBLISH_TOKEN env var before running 'git push'. This hook
+#   reads the file, deletes it immediately (one-shot), and verifies it matches
+#   the env var. A direct 'git push origin main' will fail because no token
+#   exists.
+#
+# For pushes to any other branch:
+#   Runs lint / syntax / manifest checks so feature branch CI is fast.
 #
 # Install: ln -sf ../../scripts/pre-push .git/hooks/pre-push
 set -euo pipefail
@@ -16,11 +25,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     PUSHING_TO_MAIN=1
   fi
 done
-
-# Only gate pushes to main
-if [ "$PUSHING_TO_MAIN" = "0" ]; then
-  exit 0
-fi
 
 echo ""
 echo "========================================"
@@ -42,10 +46,15 @@ echo ""
 # ── 1. Lint ──────────────────────────────────────────────
 echo "── 1. Lint ──"
 uvx ruff check scripts/token-reporter.py || {
-  echo ""; echo "BLOCKED: ruff check failed."; exit 1
+  echo ""
+  echo "BLOCKED: ruff check failed."
+  exit 1
 }
 uvx ruff format --check scripts/token-reporter.py || {
-  echo ""; echo "BLOCKED: ruff format check failed. Run: uvx ruff format scripts/token-reporter.py"; exit 1
+  echo ""
+  echo "BLOCKED: ruff format check failed."
+  echo "Run: uvx ruff format scripts/token-reporter.py"
+  exit 1
 }
 echo "OK: lint passed"
 echo ""
@@ -53,7 +62,9 @@ echo ""
 # ── 2. Syntax check ─────────────────────────────────────
 echo "── 2. Syntax check ──"
 python3 -m py_compile scripts/token-reporter.py || {
-  echo ""; echo "BLOCKED: syntax error in token-reporter.py"; exit 1
+  echo ""
+  echo "BLOCKED: syntax error in token-reporter.py"
+  exit 1
 }
 echo "OK: syntax valid"
 echo ""
@@ -61,10 +72,83 @@ echo ""
 # ── 3. Plugin manifest check ────────────────────────────
 echo "── 3. Plugin manifest ──"
 python3 -c "import json; json.load(open('.claude-plugin/plugin.json'))" || {
-  echo ""; echo "BLOCKED: plugin.json is not valid JSON"; exit 1
+  echo ""
+  echo "BLOCKED: plugin.json is not valid JSON"
+  exit 1
 }
 echo "OK: plugin.json valid"
 echo ""
+
+# ── 4. Main push ⇒ require publish.py caller ────────────
+if [ "$PUSHING_TO_MAIN" = "1" ]; then
+  echo "── 4. Publish gate (main branch) ──"
+  GATE_FILE="$(git rev-parse --git-path publish-gate)"
+
+  # The gate token file MUST exist. It is written by scripts/publish.py
+  # right after it passes ALL quality gates (lint, type, syntax, tests,
+  # CPV validation) and right before it calls 'git push'.
+  if [ ! -f "$GATE_FILE" ]; then
+    echo ""
+    echo "BLOCKED: direct 'git push' to main is forbidden."
+    echo ""
+    echo "  Pushes to main MUST go through scripts/publish.py, which runs"
+    echo "  the full release pipeline (lint, type check, syntax, tests,"
+    echo "  CPV validation, version bump, changelog, tag, push, release)."
+    echo ""
+    echo "  To publish a release:"
+    echo "    uv run scripts/publish.py                # auto-bump via git-cliff"
+    echo "    uv run scripts/publish.py --patch        # force patch bump"
+    echo "    uv run scripts/publish.py --minor        # force minor bump"
+    echo "    uv run scripts/publish.py --major        # force major bump"
+    echo "    uv run scripts/publish.py --set X.Y.Z    # explicit version"
+    echo ""
+    echo "  Do NOT try to bypass this by manually creating $GATE_FILE."
+    echo ""
+    exit 1
+  fi
+
+  # One-shot: read the token, THEN delete the file immediately so a
+  # subsequent manual push cannot reuse it.
+  FILE_TOKEN="$(cat "$GATE_FILE")"
+  rm -f "$GATE_FILE"
+
+  # The token must match the env var that publish.py sets in the
+  # subprocess environment. If an attacker copied the file but didn't
+  # set the env var (or set it to a different value), this fails.
+  if [ -z "${TOKEN_REPORTER_PUBLISH_TOKEN:-}" ]; then
+    echo ""
+    echo "BLOCKED: publish gate token file exists but env var is missing."
+    echo "  This usually means someone tried to bypass the release pipeline."
+    echo "  Run scripts/publish.py to publish — never push to main directly."
+    echo ""
+    exit 1
+  fi
+
+  if [ "$FILE_TOKEN" != "$TOKEN_REPORTER_PUBLISH_TOKEN" ]; then
+    echo ""
+    echo "BLOCKED: publish gate token mismatch."
+    echo "  File token:  $FILE_TOKEN"
+    echo "  Env token:   $TOKEN_REPORTER_PUBLISH_TOKEN"
+    echo ""
+    exit 1
+  fi
+
+  # The token also encodes the current HEAD commit SHA, so the push must
+  # be pushing exactly the commit that publish.py prepared.
+  HEAD_SHA="$(git rev-parse HEAD)"
+  if [[ "$FILE_TOKEN" != *"$HEAD_SHA"* ]]; then
+    echo ""
+    echo "BLOCKED: publish gate token does not match current HEAD."
+    echo "  Expected HEAD: $HEAD_SHA"
+    echo "  Token:         $FILE_TOKEN"
+    echo ""
+    echo "  The publish pipeline and push are out of sync."
+    exit 1
+  fi
+
+  echo "OK: publish.py caller verified (token matched, one-shot consumed)"
+  echo ""
+fi
 
 echo "========================================"
 echo "  All checks passed — pushing"
