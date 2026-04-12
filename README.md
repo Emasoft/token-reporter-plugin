@@ -191,7 +191,7 @@ token-reporter/
     workflows/
       notify-marketplace.yml  # Auto-notify emasoft-plugins on version bump
   bin/
-    token-report.sh        # v2.1.91+ bin/ helper — on-demand report (.sh to satisfy CPV binary naming rules)
+    token-report.py        # v2.1.91+ bin/ helper — on-demand report (cross-platform Python wrapper)
   hooks/
     hooks.json             # Hook event → command mapping (9 events)
   scripts/
@@ -242,21 +242,21 @@ The plugin registers nine hook events in `hooks/hooks.json`. The first five prod
 
 ## On-demand report (v2.1.91+ bin/ helper)
 
-The plugin ships `bin/token-report.sh`, a shell wrapper that prints a report on demand without waiting for the Stop hook. Because v2.1.91+ adds `bin/` executables to the Bash tool's PATH while the plugin is enabled, you can ask Claude Code to run it directly:
+The plugin ships `bin/token-report.py`, a Python wrapper that prints a report on demand without waiting for the Stop hook. Because v2.1.91+ adds `bin/` executables to the Bash tool's PATH while the plugin is enabled, you can ask Claude Code to run it directly:
 
 ```
-Please run: token-report.sh
+Please run: token-report.py
 ```
 
 Or from any shell inside the project:
 
 ```bash
-cd /path/to/project && /path/to/plugin/bin/token-report.sh
+cd /path/to/project && /path/to/plugin/bin/token-report.py
 ```
 
 The helper reads the current session transcript (found via `${CLAUDE_PROJECT_DIR}` / newest JSONL under `~/.claude/projects/<slug>/`) and prints the same report format as the Stop hook, but to stdout as plain text instead of as a `systemMessage`. Useful for mid-session snapshots.
 
-The `.sh` extension is intentional — CPV (claude-plugins-validation) flags any extensionless executable in `bin/` as a compiled binary missing platform suffixes. Using `.sh` makes it explicit that this is a portable shell script.
+Python was chosen over Bash so the helper is cross-platform (macOS, Linux, Windows) as long as `uv` is on PATH. CPV (claude-plugins-validation) flags extensionless executables and `.sh` files as platform-specific; `.py` is recognized as cross-platform.
 
 ## User config (v2.1.90+)
 
