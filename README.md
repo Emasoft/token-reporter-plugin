@@ -3,7 +3,7 @@
 <!--BADGES-START-->
 <!--BADGES-END-->
 
-A Claude Code plugin that displays per-operation token usage when agents and subagents complete. **Only outputs in debug mode** (`claude --debug`).
+A Claude Code plugin that displays per-operation token usage when agents and subagents complete. **Only outputs in debug mode** (`claude --debug`). Tracks **Claude Code 2.1.85–2.1.101**.
 
 ## What it reports
 
@@ -18,11 +18,15 @@ After each Claude Code response (in debug mode), a compact unicode-bordered repo
   - Bash side effect (linter/formatter modifies files → file watcher invalidates)
   - External change (file watcher detects non-Claude modifications)
   - Penalty cost and batching opportunity analysis
+- **Compact boundary markers** — v2.1.90 ground-truth `system/compact_boundary` events with `preTokens` from auto-compaction
+- **CLAUDE.md / rule reloads** — v2.1.101 `InstructionsLoaded` events, broken down by `load_reason` (session_start, nested_traversal, path_glob_match, include, **compact**) with red warning for compact-triggered reloads
+- **PostCompact / PermissionDenied / TaskCreated** — v2.1.90+ lifecycle events rolled into the next Stop report
+- **tool-results/ spillover** — v2.1.90 large tool outputs spilled to `~/.claude/projects/<project>/<session>/tool-results/` are credited to the originating tool
 - **Worktree sub-agent breakdown** — dedicated box showing per-agent cache dynamics when skills spawn agent swarms in worktrees
 - **Duration** — elapsed time from first to last message in the operation
 - **Per-tool attribution** — input, output, and result tokens for each tool used
 - **Cost estimate** — based on published Anthropic API pricing, scoped to lifetime (agents) or current operation (session)
-- **Agent identity** — agent type/name, model, message count, duration
+- **Agent identity** — agent type/name (via v2.1.101 `agent_id`/`agent_type` hook input fields), model, message count, duration
 - **Bash commands** — every shell command executed, listed individually
 - **Web fetches** — every URL fetched, listed individually
 - **Files touched** — read, edited, and written files all listed individually
@@ -95,7 +99,7 @@ MCP tool names (e.g. `mcp__chrome-devtools__take_screenshot`) are shortened to `
 
 - **uv** — the script runs via `uv run --with tiktoken` to manage the tiktoken dependency automatically
 - **Python 3.8+** — any Python 3.8+ accessible to uv
-- **Claude Code 2.1.85+** — for v2.1.85 JSONL format (agentId removed, toolUseResult.agentId added). StopFailure requires 2.1.78+. TeammateIdle/TaskCompleted require 2.1.69+
+- **Claude Code 2.1.85+** — for v2.1.85 JSONL format (agentId removed, toolUseResult.agentId added). StopFailure requires 2.1.78+. TeammateIdle/TaskCompleted require 2.1.69+. PostCompact/TaskCreated/PermissionDenied require 2.1.90+. InstructionsLoaded / `agent_id` / `agent_type` hook input fields require 2.1.101+. Lower versions silently ignore the hook registrations for events they don't support.
 
 Install uv if you don't have it:
 ```bash
@@ -182,14 +186,16 @@ Restart Claude Code to activate.
 ```
 token-reporter/
   .claude-plugin/
-    plugin.json            # Plugin manifest
+    plugin.json            # Plugin manifest (userConfig: OUTPUT_LIMIT_CHARS)
   .github/
     workflows/
       notify-marketplace.yml  # Auto-notify emasoft-plugins on version bump
+  bin/
+    token-report           # v2.1.91+ bin/ executable — on-demand report
   hooks/
-    hooks.json             # Hook event → command mapping (5 events)
+    hooks.json             # Hook event → command mapping (9 events)
   scripts/
-    token-reporter.py      # Main hook script (~1900 LOC)
+    token-reporter.py      # Main hook script (~2400 LOC)
     bump_version.py        # Semver bumper for plugin.json
     publish.py             # Release pipeline (lint, CPV validation, bump, tag, push, gh release)
     pre-push               # Git pre-push quality gate (symlinked to .git/hooks/pre-push)
@@ -211,7 +217,9 @@ Without `--debug`, the hook exits immediately with no output.
 
 ## How it works
 
-The plugin registers five hook events in `hooks/hooks.json`:
+The plugin registers nine hook events in `hooks/hooks.json`. The first five produce reports; the remaining four are lightweight event-loggers that fold into the next Stop/SubagentStop report (so they don't spam the terminal).
+
+**Report-emitting hooks:**
 
 | Hook Event | When it fires | What the script does | Cost label |
 |---|---|---|---|
@@ -220,6 +228,43 @@ The plugin registers five hook events in `hooks/hooks.json`:
 | **SubagentStop** | Subagent (Explore, Plan, etc.) finished | Parses agent's full lifetime transcript | `(lifetime)` |
 | **TeammateIdle** | Teammate agent paused/waiting | Same as SubagentStop | `(lifetime)` |
 | **TaskCompleted** | Background task finished | Same as SubagentStop | `(lifetime)` |
+
+**Lightweight event-log hooks** (v2.1.90+):
+
+| Hook Event | Claude Code | Recorded to `${CLAUDE_PLUGIN_DATA}/events/` and surfaced next Stop |
+|---|---|---|
+| **InstructionsLoaded** | 2.1.101+ | `file_path`, `memory_type`, `load_reason` (incl. `compact`), `globs`, `trigger_file_path`, `parent_file_path` |
+| **PostCompact** | 2.1.90+ | `preTokens`, `trigger`, `compactMetadata` |
+| **TaskCreated** | 2.1.90+ | `agent_id`, `agent_type` for agents spawned in the session |
+| **PermissionDenied** | 2.1.90+ | Permission-denial count surfaces as a red row in the report |
+
+**Debug gate**: The hook first walks the process tree (`getppid()` → `ps -o args=`) checking for a parent `claude` process with `--debug` flag. If not found, the hook exits immediately with no output or processing. **Lightweight hooks still log events even when --debug is off**, so the next debug-mode Stop hook report includes the full history.
+
+## On-demand report (v2.1.91+ bin/ helper)
+
+The plugin ships `bin/token-report`, a shell wrapper that prints a report on demand without waiting for the Stop hook. Because v2.1.91+ adds `bin/` executables to the Bash tool's PATH while the plugin is enabled, you can ask Claude Code to run it directly:
+
+```
+Please run: token-report
+```
+
+Or from any shell inside the project:
+
+```bash
+cd /path/to/project && token-report
+```
+
+The helper reads the current session transcript (found via `${CLAUDE_PROJECT_DIR}` / newest JSONL under `~/.claude/projects/<slug>/`) and prints the same report format as the Stop hook, but to stdout as plain text instead of as a `systemMessage`. Useful for mid-session snapshots.
+
+## User config (v2.1.90+)
+
+The plugin exposes a single `userConfig` entry in `plugin.json`:
+
+| Key | Type | Default | Purpose |
+|---|---|---|---|
+| `OUTPUT_LIMIT_CHARS` | number | `10000` | Max characters injected into the transcript. The v2.1.101 hooks reference states 10,000; the v2.1.90 changelog says 50,000. Default is conservative. Raise via `CLAUDE_PLUGIN_OPTION_OUTPUT_LIMIT_CHARS` if your version supports more.
+
+You can also set the cap via the plain env var `TOKEN_REPORTER_OUTPUT_LIMIT_CHARS` if `userConfig` is not available (local dev, older Claude Code).
 
 **Debug gate**: The hook first walks the process tree (`getppid()` → `ps -o args=`) checking for a parent `claude` process with `--debug` flag. If not found, the hook exits immediately with no output or processing.
 

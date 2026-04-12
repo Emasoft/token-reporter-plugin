@@ -49,6 +49,46 @@
           }
         ]
       }
+    ],
+    "InstructionsLoaded": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
+          }
+        ]
+      }
+    ],
+    "TaskCreated": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
+          }
+        ]
+      }
     ]
   }
 }

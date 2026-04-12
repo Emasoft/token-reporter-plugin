@@ -52,6 +52,220 @@ from typing import Any
 
 
 # ─────────────────────────────────────────────
+# Environment helpers (v2.1.90+ env vars)
+# ─────────────────────────────────────────────
+
+
+def _claude_config_dir() -> Path:
+    """Return the Claude Code config dir, honoring CLAUDE_CONFIG_DIR."""
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    if d:
+        return Path(d)
+    return Path.home() / ".claude"
+
+
+def _plugin_data_dir() -> Path:
+    """Return the persistent plugin data dir (survives plugin updates).
+
+    Priority:
+      1. ${CLAUDE_PLUGIN_DATA} (v2.1.90+)
+      2. ${CLAUDE_CONFIG_DIR}/plugins/data/token-reporter
+      3. ~/.claude/plugins/data/token-reporter
+    """
+    d = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if d:
+        return Path(d)
+    return _claude_config_dir() / "plugins" / "data" / "token-reporter"
+
+
+# Canonical field -> list of alternate names encountered in Claude Code over time.
+# Primary (first) name is what we use internally.
+_USAGE_FIELD_ALIASES = {
+    "input_tokens": ["input_tokens", "inputTokens", "input"],
+    "output_tokens": ["output_tokens", "outputTokens", "output"],
+    "cache_creation_input_tokens": [
+        "cache_creation_input_tokens",
+        "cache_creation_tokens",
+        "cacheCreation",
+        "cacheCreationInputTokens",
+    ],
+    "cache_read_input_tokens": [
+        "cache_read_input_tokens",
+        "cache_read_tokens",
+        "cacheRead",
+        "cacheReadInputTokens",
+    ],
+}
+
+
+def _get_usage_field(u: dict, canonical: str) -> int:
+    """Read a usage field accepting OTel event, OTel metric, and legacy spellings.
+
+    v2.1.101 monitoring-usage docs confirm both spellings are canonical:
+      - OTel event: cache_read_tokens, input_tokens, ...
+      - OTel metric attribute: cacheRead, input, ...
+    """
+    for alias in _USAGE_FIELD_ALIASES.get(canonical, [canonical]):
+        v = u.get(alias)
+        if v:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _record_hook_event(hook_event: str, hook_input: dict) -> None:
+    """Record a lightweight-only hook event to the plugin data dir.
+
+    Used for hooks that don't produce a report directly (InstructionsLoaded,
+    PostCompact, TaskCreated, CwdChanged, FileChanged) but whose data we want
+    to surface in the next Stop/SubagentStop report.
+
+    One JSONL file per session: {plugin_data}/events/{session_id[:16]}.jsonl
+    """
+    sid = hook_input.get("session_id", "") or "no-session"
+    sid_short = sid[:16]
+    events_dir = _plugin_data_dir() / "events"
+    try:
+        events_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    path = events_dir / f"{sid_short}.jsonl"
+    record = {
+        "hook_event": hook_event,
+        "timestamp": time.time(),
+        "session_id": sid,
+    }
+    # Copy whitelisted fields from hook_input. We avoid dumping the whole
+    # payload because it can be huge (CwdChanged/FileChanged carry diffs).
+    for k in (
+        "cwd",
+        "file_path",
+        "memory_type",
+        "load_reason",
+        "globs",
+        "trigger_file_path",
+        "parent_file_path",
+        "agent_id",
+        "agent_type",
+        "pre_tokens",
+        "preTokens",
+        "trigger",
+        "compactMetadata",
+    ):
+        if k in hook_input:
+            record[k] = hook_input[k]
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def _read_session_events(session_id: str) -> list:
+    """Read recorded lightweight hook events for a session."""
+    if not session_id:
+        return []
+    path = _plugin_data_dir() / "events" / f"{session_id[:16]}.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return out
+
+
+def _clear_session_events(session_id: str) -> None:
+    """Remove the session event log after it has been reported."""
+    if not session_id:
+        return
+    path = _plugin_data_dir() / "events" / f"{session_id[:16]}.jsonl"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _project_slug_from_cwd(cwd: str) -> str:
+    """Convert a cwd path to Claude Code's project slug format.
+
+    Claude Code stores transcripts under ~/.claude/projects/<slug>/ where
+    the slug is the cwd with "/" replaced by "-". E.g.:
+        /Users/foo/bar/baz  →  -Users-foo-bar-baz
+    """
+    if not cwd:
+        return ""
+    return cwd.replace("/", "-")
+
+
+def _find_current_session_transcript(cwd: str) -> str:
+    """Find the current session's transcript file (newest JSONL in project dir).
+
+    Used by `--on-demand` invocations (e.g., bin/token-report) that run
+    outside of a hook and therefore have no hook input JSON.
+    """
+    projects_dir = _claude_config_dir() / "projects"
+    if not projects_dir.is_dir():
+        return ""
+    # Walk the cwd upward looking for a matching slug, since the current
+    # directory may be a subdir of the session's project root.
+    probe = Path(cwd).resolve() if cwd else Path.cwd()
+    candidates = []
+    while True:
+        slug = _project_slug_from_cwd(str(probe))
+        pdir = projects_dir / slug
+        if pdir.is_dir():
+            for f in pdir.glob("*.jsonl"):
+                if f.is_file():
+                    try:
+                        candidates.append((f.stat().st_mtime, str(f)))
+                    except OSError:
+                        continue
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    if not candidates:
+        return ""
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+# Regex for inline skill shell execution: !`command` and ```!...``` blocks
+# (v2.1.91+). These run as preprocessing — they don't appear in the transcript
+# as Bash tool calls, so the plugin's normal tool-attribution misses them.
+_INLINE_SHELL_TICK = re.compile(r"!`([^`]+)`")
+_INLINE_SHELL_FENCE = re.compile(r"```!\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _count_inline_shell_tokens(text: str) -> int:
+    """Count tokens in inline !`...` shell blocks inside skill/user content.
+
+    Note: this detects the SHELL COMMAND itself, not its output. The output
+    is injected into the skill prompt by Claude Code and counted as part of
+    the regular usage dict input_tokens.
+    """
+    if not text or "`" not in text:
+        return 0
+    total = 0
+    for m in _INLINE_SHELL_TICK.finditer(text):
+        total += count_tokens(m.group(1))
+    for m in _INLINE_SHELL_FENCE.finditer(text):
+        total += count_tokens(m.group(1))
+    return total
+
+
+# ─────────────────────────────────────────────
 # Debug mode detection — walk process tree
 # ─────────────────────────────────────────────
 
@@ -388,6 +602,16 @@ def _merge_usage(base: dict, add: dict):
         base["last_timestamp"] = t1_add
     # Merge cache events
     base.setdefault("cache_events", []).extend(add.get("cache_events", []))
+    # Merge compact events (v2.1.90+)
+    base.setdefault("compact_events", []).extend(add.get("compact_events", []))
+    # Accumulate spilled tool output bytes (v2.1.90 tool-results/)
+    base["spilled_tool_bytes"] = base.get("spilled_tool_bytes", 0) + add.get(
+        "spilled_tool_bytes", 0
+    )
+    # Accumulate skill preprocessing tokens (v2.1.91+ inline !`...`)
+    base["skill_preprocessing_tokens"] = base.get(
+        "skill_preprocessing_tokens", 0
+    ) + add.get("skill_preprocessing_tokens", 0)
 
 
 def parse_jsonl(filepath: str):
@@ -685,6 +909,9 @@ def parse_agent_transcript(
         "first_timestamp": "",
         "last_timestamp": "",
         "cache_events": [],  # detected invalidation/TTL expiry events
+        "compact_events": [],  # v2.1.90+ compact_boundary markers
+        "spilled_tool_bytes": 0,  # v2.1.90 tool-results/ spillover files
+        "skill_preprocessing_tokens": 0,  # v2.1.91+ !`...` inline shell
     }
     seen = set()
     # State for cache invalidation detection
@@ -724,6 +951,27 @@ def parse_agent_transcript(
     # Map tool_use_id -> tool_name so we can attribute tool_result costs
     tool_use_id_map = {}  # type: dict[str, str]
 
+    # v2.1.90: large tool outputs are spilled to
+    #   {transcript_parent}/{session_id}/tool-results/*.json
+    # If present, compute the aggregate spill size so we can credit the
+    # corresponding tool's result_tokens at the end of the parse.
+    transcript_parent = Path(path).parent
+    transcript_stem = Path(path).stem
+    spill_dir = transcript_parent / transcript_stem / "tool-results"
+    spill_files: dict[str, int] = {}  # tool_use_id prefix -> size bytes
+    if spill_dir.is_dir():
+        try:
+            for sf in spill_dir.iterdir():
+                if sf.is_file():
+                    # Files are typically named "<tool_use_id>.<ext>"
+                    key = sf.stem
+                    try:
+                        spill_files[key] = sf.stat().st_size
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
     for entry in all_entries[start_index:]:
         etype = entry.get("type", "")
 
@@ -734,11 +982,37 @@ def parse_agent_transcript(
                 r["first_timestamp"] = ts
             r["last_timestamp"] = ts
 
+        # ── v2.1.90+ compact_boundary system event ──
+        # Ground-truth marker emitted by auto-compaction. Use the preTokens
+        # value as a historical compaction record instead of inferring from
+        # usage-dict drops. Subagent transcripts persist independently so
+        # these can appear outside the Stop event window.
+        if etype == "system" and entry.get("subtype") == "compact_boundary":
+            cm = entry.get("compactMetadata", {})
+            try:
+                pre = int(cm.get("preTokens", 0) or 0)
+            except (TypeError, ValueError):
+                pre = 0
+            r["compact_events"].append(
+                {
+                    "trigger": cm.get("trigger", ""),
+                    "pre_tokens": pre,
+                    "timestamp": ts,
+                }
+            )
+            continue
+
         # ── Process user entries: scan tool_result blocks for content size ──
         if etype == "user":
             matched_tuids = set()  # track which tool_use_ids we already counted
             msg = entry.get("message", {})
             content = msg.get("content", [])
+            # v2.1.91+ inline shell detection: scan string content for !`...`
+            # and ```!...``` blocks. Skill content enters the conversation as
+            # a user message; if the skill's source happens to surface here
+            # verbatim, we credit the blocks to skill preprocessing bytes.
+            if isinstance(content, str) and content:
+                r["skill_preprocessing_tokens"] += _count_inline_shell_tokens(content)
             if isinstance(content, list):
                 for block in content:
                     if (
@@ -812,7 +1086,9 @@ def parse_agent_transcript(
                     "cache_creation_input_tokens",
                     "cache_read_input_tokens",
                 ]:
-                    v = u.get(f, 0)
+                    # Accept both OTel event form (snake_case with _tokens)
+                    # and OTel metric form (camelCase) — see _USAGE_FIELD_ALIASES
+                    v = _get_usage_field(u, f)
                     r[f] += v
                     r["models_used"][model][f] += v
                 r["message_count"] += 1
@@ -824,9 +1100,9 @@ def parse_agent_transcript(
                 # re-sent. Two main causes:
                 #   1. TTL expiry (>5 min idle → "hey!" effect)
                 #   2. File change (Edit/Write → loadChangedFiles() invalidates)
-                cw = u.get("cache_creation_input_tokens", 0)
-                cr = u.get("cache_read_input_tokens", 0)
-                inp = u.get("input_tokens", 0)
+                cw = _get_usage_field(u, "cache_creation_input_tokens")
+                cr = _get_usage_field(u, "cache_read_input_tokens")
+                inp = _get_usage_field(u, "input_tokens")
                 total_cache = cw + cr
                 # Detect: cache_creation dominates (>80%) AND is substantial (>50K)
                 is_spike = cw > 50_000 and total_cache > 0 and (cw / total_cache) > 0.80
@@ -944,6 +1220,25 @@ def parse_agent_transcript(
     r["files_read"] = sorted(r["files_read"])
     r["files_written"] = sorted(r["files_written"])
     r["files_edited"] = sorted(r["files_edited"])
+
+    # v2.1.90 tool-results/ spillover: credit any spilled files to the tool
+    # that produced them. Filename stem is typically the tool_use_id.
+    # Rough token approximation: bytes/4 (same as tiktoken fallback).
+    if spill_files:
+        total_spill = 0
+        for key, size in spill_files.items():
+            total_spill += size
+            # Try exact match first, then longest-prefix match
+            tool_name = tool_use_id_map.get(key, "")
+            if not tool_name:
+                for tuid, tn in tool_use_id_map.items():
+                    if key.startswith(tuid) or tuid.startswith(key):
+                        tool_name = tn
+                        break
+            if tool_name:
+                r["tools_tokens"][tool_name]["result_tokens"] += size // 4
+        r["spilled_tool_bytes"] = total_spill
+
     return r
 
 
@@ -972,6 +1267,7 @@ def build_report(
     usage: dict,
     identity: dict,
     sub_usage_list: list[Any] | None = None,
+    session_events: list | None = None,
 ) -> str:
     """Build a compact unicode-bordered report for terminal display."""
     is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
@@ -1176,6 +1472,89 @@ def build_report(
                 rows.append(
                     ("", f"  {Y}⟳ {saved} could be avoided by batching file changes{R}")
                 )
+
+    # ── v2.1.90+ compact_boundary events (authoritative compaction markers) ──
+    compact_events = usage.get("compact_events", [])
+    if compact_events:
+        rows.append(
+            (
+                "Compact",
+                f"{W}{len(compact_events)}{R}"
+                f" {S}auto-compaction boundar"
+                f"{'ies' if len(compact_events) != 1 else 'y'}{R}",
+            )
+        )
+        for ce in compact_events[:3]:
+            pre = ce.get("pre_tokens", 0)
+            trig = ce.get("trigger", "auto")
+            rows.append(
+                (
+                    "",
+                    f"  {S}·{R} {W}{fmt_tok(pre)}{R} {S}pre-compact ({trig}){R}",
+                )
+            )
+
+    # ── v2.1.101+ InstructionsLoaded + other lightweight session events ──
+    if session_events:
+        instr_events = [
+            e for e in session_events if e.get("hook_event") == "InstructionsLoaded"
+        ]
+        compact_hooks = [
+            e for e in session_events if e.get("hook_event") == "PostCompact"
+        ]
+        fc_events = [e for e in session_events if e.get("hook_event") == "FileChanged"]
+        cwd_events = [e for e in session_events if e.get("hook_event") == "CwdChanged"]
+        pd_events = [
+            e for e in session_events if e.get("hook_event") == "PermissionDenied"
+        ]
+        task_created = [
+            e for e in session_events if e.get("hook_event") == "TaskCreated"
+        ]
+
+        if instr_events:
+            reasons = Counter(e.get("load_reason", "unknown") for e in instr_events)
+            reason_str = ", ".join(f"{k} x{v}" for k, v in reasons.most_common())
+            rows.append(
+                (
+                    "Rules",
+                    f"{W}{len(instr_events)}{R} {S}CLAUDE.md / rules loads{R}",
+                )
+            )
+            rows.append(("", f"  {S}·{R} {W}{reason_str}{R}"))
+            # Highlight compact-triggered reloads (cache invalidation)
+            compact_reloads = reasons.get("compact", 0)
+            if compact_reloads:
+                rows.append(
+                    (
+                        "",
+                        f"  {RED}⚠{R} {W}{compact_reloads}{R}"
+                        f" {S}rule reload(s) triggered by compact{R}",
+                    )
+                )
+        if compact_hooks:
+            rows.append(
+                ("", f"  {S}·{R} {W}{len(compact_hooks)}{R} {S}PostCompact event(s){R}")
+            )
+        if fc_events:
+            rows.append(
+                (
+                    "FileChanged",
+                    f"{W}{len(fc_events)}{R} {S}external file event(s){R}",
+                )
+            )
+        if cwd_events:
+            rows.append(
+                ("CwdChanged", f"{W}{len(cwd_events)}{R} {S}directory transitions{R}")
+            )
+        if pd_events:
+            rows.append(
+                (
+                    "Denied",
+                    f"{RED}{len(pd_events)}{R} {S}permission denial(s){R}",
+                )
+            )
+        if task_created:
+            rows.append(("Tasks", f"{W}{len(task_created)}{R} {S}agents spawned{R}"))
 
     # Cost — label reflects scope: "(lifetime)" for completed
     # agents, "(this op)" for session
@@ -1795,6 +2174,52 @@ def dbg(msg: str):
 def main():
     dbg("hook invoked")
 
+    # ── --on-demand mode (bin/token-report invocation, not a hook) ──
+    # No hook input, no --debug requirement. Print the current session's
+    # report to stdout as plain text. Synthesizes a minimal hook_input
+    # payload from env vars + current working directory.
+    if "--on-demand" in sys.argv:
+        cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        session_id = os.environ.get("CLAUDE_SESSION_ID", "")
+        transcript_path = _find_current_session_transcript(cwd)
+        if not transcript_path:
+            print(
+                "[token-reporter] no session transcript found for cwd={}".format(cwd),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not session_id:
+            session_id = Path(transcript_path).stem
+        synthetic_input = {
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": cwd,
+            "hook_event_name": "OnDemand",
+        }
+        usage = parse_agent_transcript(
+            transcript_path, session_id="", last_op_only=False
+        )
+        if usage.get("message_count", 0) == 0:
+            print(
+                "[token-reporter] transcript {} has no parseable messages".format(
+                    transcript_path
+                ),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        session_events = _read_session_events(session_id)
+        report = build_report(
+            "OnDemand",
+            synthetic_input,
+            usage,
+            identity={},
+            sub_usage_list=None,
+            session_events=session_events,
+        )
+        # Plain text (no JSON wrapper) — user reads it directly from terminal
+        print(report)
+        sys.exit(0)
+
     # Only produce output when Claude Code is running with --debug
     if not _is_debug_mode():
         dbg("not in debug mode, skipping")
@@ -1816,7 +2241,8 @@ def main():
     agent_type = hook_input.get("agent_type", "")
     agent_transcript_path = hook_input.get("agent_transcript_path", "")
     # v2.1.85: agentId removed from JSONL entries. Hook input may still
-    # provide agent_id; if not, extract from agent_transcript_path filename
+    # provide agent_id (v2.1.101 added it as a common subagent-hook field).
+    # If absent, extract from agent_transcript_path filename
     # (pattern: agent-{agentId}.jsonl). Do NOT fall back to session_id —
     # multiple agents can share a session.
     agent_id = hook_input.get("agent_id", "")
@@ -1824,6 +2250,22 @@ def main():
         stem = Path(agent_transcript_path).stem  # "agent-{id}"
         if stem.startswith("agent-"):
             agent_id = stem[6:]
+
+    # v2.1.90+ lightweight hooks: no transcript parsing, just record the
+    # event to the session event log so the next Stop/SubagentStop report
+    # can include the count/details. These fire too often to emit reports.
+    LIGHTWEIGHT_HOOKS = {
+        "InstructionsLoaded",  # v2.1.101: CLAUDE.md / .claude/rules/* load
+        "PostCompact",  # v2.1.90: compaction boundary
+        "TaskCreated",  # v2.1.90: agent spawn
+        "CwdChanged",  # v2.1.97/98: working dir changed
+        "FileChanged",  # v2.1.97/98: external file change
+        "PermissionDenied",  # v2.1.90: permission denial
+    }
+    if hook_event in LIGHTWEIGHT_HOOKS:
+        _record_hook_event(hook_event, hook_input)
+        dbg(f"recorded lightweight event {hook_event}")
+        sys.exit(0)
 
     if not session_id and not agent_transcript_path:
         dbg("exit: no session_id and no agent_transcript_path")
@@ -1921,8 +2363,23 @@ def main():
             f"inp={usage['input_tokens']} out={usage['output_tokens']}"
         )
 
-    # Step 3: Build report (pass sub_usage_list for summary in main box)
-    report = build_report(hook_event, hook_input, usage, identity, sub_usage_list)
+    # Step 3: Read lightweight session events recorded by other hooks.
+    # These are events like InstructionsLoaded, PostCompact, TaskCreated,
+    # FileChanged, CwdChanged, PermissionDenied — they fire too often to
+    # emit reports directly, so we log them to disk and fold them into
+    # the next Stop/SubagentStop report.
+    session_events = _read_session_events(session_id)
+    dbg(f"read {len(session_events)} session events")
+
+    # Step 4: Build report (pass sub_usage_list for summary in main box)
+    report = build_report(
+        hook_event,
+        hook_input,
+        usage,
+        identity,
+        sub_usage_list,
+        session_events=session_events,
+    )
     dbg(f"report built, length={len(report)}")
 
     # Step 3b: Build dedicated worktree box if sub-agents were found.
@@ -1971,9 +2428,26 @@ def main():
     all_reports = subagent_reports + [report]
     combined = "\n".join(all_reports)
 
-    # v2.1.89: hook output >50K chars is saved to disk with a preview
-    # instead of being injected into context. Cap our output to avoid this.
-    MAX_HOOK_OUTPUT = 48_000  # leave headroom below 50K
+    # Hook output character cap. Claude Code docs disagree:
+    #   - Hooks reference (v2.1.101): "Output is capped at 10,000 characters"
+    #   - Changelog v2.1.90: "Hook output >50K characters saved to disk"
+    # We default to 10K (safest) but allow override via env var or the
+    # CLAUDE_PLUGIN_OPTION_OUTPUT_LIMIT_CHARS user config value.
+    def _resolve_output_limit() -> int:
+        raw = (
+            os.environ.get("TOKEN_REPORTER_OUTPUT_LIMIT_CHARS")
+            or os.environ.get("CLAUDE_PLUGIN_OPTION_OUTPUT_LIMIT_CHARS")
+            or ""
+        )
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+        return 10_000
+
+    MAX_HOOK_OUTPUT = _resolve_output_limit()
     if len(combined) > MAX_HOOK_OUTPUT:
         dbg(
             f"WARNING: output {len(combined)} chars exceeds {MAX_HOOK_OUTPUT}, "
@@ -1987,6 +2461,10 @@ def main():
         # If still too large, hard-truncate
         if len(combined) > MAX_HOOK_OUTPUT:
             combined = combined[:MAX_HOOK_OUTPUT] + "\n[...truncated]"
+
+    # Stop event successfully reported — clear the session event log so
+    # the next session starts fresh.
+    _clear_session_events(session_id)
 
     output = {"systemMessage": combined}
     print(json.dumps(output))
