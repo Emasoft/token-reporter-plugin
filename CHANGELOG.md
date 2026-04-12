@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.0] - 2026-04-12
+
+
+### Bug Fixes
+
+- Rename bin/token-report to bin/token-report.sh for CPV compliance
+- Use Python wrapper for bin/ helper (CPV cross-platform rule)
+
+
+### Features
+
+- Support Claude Code 2.1.90-2.1.101 events and on-demand report
+
 ## [1.6.0] - 2026-04-10
 
 
