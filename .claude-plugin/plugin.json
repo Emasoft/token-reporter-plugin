@@ -25,6 +25,7 @@
   "userConfig": {
     "OUTPUT_LIMIT_CHARS": {
       "type": "number",
+      "title": "Hook output character limit",
       "default": 10000,
       "description": "Maximum character count for the report injected into the transcript. Claude Code's hooks reference states 10,000 chars; the 2.1.90 changelog says 50,000. Keep low (10000) for safety, raise to 48000 if your Claude Code version supports it."
     }
