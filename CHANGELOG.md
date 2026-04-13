@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.1] - 2026-04-13
+
+
+### Bug Fixes
+
+- Add required userConfig.title field to plugin.json
+- Track uv.lock for reproducible builds (CPV requirement)
+
 ## [1.7.0] - 2026-04-12
 
 
