@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.0] - 2026-04-15
+
+
+### Bug Fixes
+
+- Credit skills on all three result paths
+
+
+### Features
+
+- Track per-skill and per-agent-type token costs
+
+
+### Miscellaneous
+
+- Sync uv.lock
+
 ## [1.7.2] - 2026-04-15
 
 
