@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.2] - 2026-04-15
+
+
+### Bug Fixes
+
+- Correct output_tokens under-count from streaming chunks
+
 ## [1.7.1] - 2026-04-13
 
 
