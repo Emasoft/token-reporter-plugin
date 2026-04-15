@@ -27,11 +27,14 @@ After each Claude Code response (in debug mode), a compact unicode-bordered repo
 - **Per-tool attribution** — input, output, and result tokens for each tool used
 - **Per-skill attribution** — v2.1.108+ built-in slash commands route through the `Skill` tool. Each skill invocation shows invocation count, result→input bytes (the skill content loaded into context), output bytes, and an estimated cost per skill. Skills are sorted by cost so the biggest drains float to the top
 - **Sub-agent aggregation by type** — when the same agent type is spawned multiple times (e.g. `Explore x5`), an aggregated row shows the total count, tokens, and cost per type in addition to the individual per-instance drill-down
+- **Standalone Skills box** *(opt-in via `SKILLS_BOX`)* — when enabled, the per-skill breakdown is rendered in its own dedicated unicode box instead of as an inline section in the main report
+- **Per-section truncation** *(`MAX_ENTRIES_PER_SECTION`, default 12)* — long lists (skills, bash, web, files, sub-agents) are capped to keep inline output under Claude Code's hook output limit, with a `⋯ +N more — see HTML report` indicator
+- **Full HTML report** *(`HTML_REPORT`, default on)* — every Stop/SubagentStop event also writes a self-contained nicely-formatted HTML file to `~/.claude/token-reporter-html/<project>/` containing **every** section without truncation. The inline output ends with a `Full report: <path>` footer line so you can open the complete record in a browser
 - **Cost estimate** — based on published Anthropic API pricing, scoped to lifetime (agents) or current operation (session)
 - **Agent identity** — agent type/name (via v2.1.101 `agent_id`/`agent_type` hook input fields), model, message count, duration
-- **Bash commands** — every shell command executed, listed individually
-- **Web fetches** — every URL fetched, listed individually
-- **Files touched** — read, edited, and written files all listed individually
+- **Bash commands** — every shell command executed (full list in HTML, capped inline)
+- **Web fetches** — every URL fetched (full list in HTML, capped inline)
+- **Files touched** — read, edited, and written files (full list in HTML, capped inline)
 
 ```
 ╭──────────────────────────────────────────────────────────────╮
@@ -262,13 +265,16 @@ Python was chosen over Bash so the helper is cross-platform (macOS, Linux, Windo
 
 ## User config (v2.1.90+)
 
-The plugin exposes a single `userConfig` entry in `plugin.json`:
+The plugin exposes four `userConfig` entries in `plugin.json`. Each one is also overridable via a plain env var (prefix `TOKEN_REPORTER_`) for local development or older Claude Code versions that lack `userConfig` support.
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `OUTPUT_LIMIT_CHARS` | number | `10000` | Max characters injected into the transcript. The v2.1.101 hooks reference states 10,000; the v2.1.90 changelog says 50,000. Default is conservative. Raise via `CLAUDE_PLUGIN_OPTION_OUTPUT_LIMIT_CHARS` if your version supports more.
+| `OUTPUT_LIMIT_CHARS` | number | `10000` | Max characters injected into the transcript. The v2.1.101 hooks reference states 10,000; the v2.1.90 changelog says 50,000. Default is conservative. Raise via `CLAUDE_PLUGIN_OPTION_OUTPUT_LIMIT_CHARS` if your version supports more. |
+| `SKILLS_BOX` | boolean | `false` | When `true`, the per-skill cost breakdown is rendered in its own dedicated unicode box instead of as an inline section in the main report. Useful for sessions with many skill invocations where the inline section would crowd the main box. |
+| `MAX_ENTRIES_PER_SECTION` | number | `12` | Caps the number of entries shown per inline list section (skills, bash commands, web fetches, files, sub-agents). Lists exceeding this length show a `⋯ +N more — see HTML report` indicator. The full untruncated data is always available in the HTML report. Set to `0` to disable truncation entirely. |
+| `HTML_REPORT` | boolean | `true` | Save a self-contained nicely-formatted HTML report (full data, no truncation) to `~/.claude/token-reporter-html/<project-slug>/<timestamp>-<event>-<session>.html` after every Stop/SubagentStop event. The path is appended to the inline output as a `Full report:` footer line so you can open the complete record in a browser. |
 
-You can also set the cap via the plain env var `TOKEN_REPORTER_OUTPUT_LIMIT_CHARS` if `userConfig` is not available (local dev, older Claude Code).
+Env var overrides (dev/local): `TOKEN_REPORTER_OUTPUT_LIMIT_CHARS`, `TOKEN_REPORTER_SKILLS_BOX`, `TOKEN_REPORTER_MAX_ENTRIES_PER_SECTION`, `TOKEN_REPORTER_HTML_REPORT`. Boolean values accept `1/true/yes/on` and `0/false/no/off` (case-insensitive).
 
 **Why the temp file pattern?** Claude Code only renders `systemMessage` output to the terminal for Stop events. SubagentStop/TeammateIdle/TaskCompleted output is consumed as system context but not displayed. So the script saves child agent reports to temp files, and the Stop hook collects and displays them all together.
 

@@ -1398,6 +1398,59 @@ def _rel_path(filepath: str, project_dir: str) -> str:
             return filepath
 
 
+def _cap_list(items: list, max_n: int) -> tuple[list, int]:
+    """Cap a list to max_n entries; return (capped, hidden_count).
+
+    max_n <= 0 disables truncation (returns original list, hidden=0).
+    Used by build_report and build_skills_box to enforce the
+    MAX_ENTRIES_PER_SECTION user config so the inline output never blows
+    past Claude Code's hook output cap. The full untruncated data is
+    always available via the HTML report.
+    """
+    if max_n <= 0 or len(items) <= max_n:
+        return items, 0
+    return items[:max_n], len(items) - max_n
+
+
+def _compute_skill_rows(
+    usage: dict,
+) -> tuple[list[tuple[str, int, int, int, float]], float]:
+    """Return per-skill cost rows sorted by cost descending, plus total cost.
+
+    Each row is (skill_name, invocation_count, result_tokens, output_tokens,
+    cost). Used by both build_report (inline section) and build_skills_box
+    (standalone box) so the two views stay in sync. The reference model for
+    pricing is the most-used real (non-synthetic) model in the usage dict —
+    if no real model is present, get_pricing("") returns DEFAULT_PRICING.
+    """
+    skills_used_ctr = usage.get("skills_used", Counter())
+    skills_tokens_d = usage.get("skills_tokens", {})
+    if not skills_used_ctr:
+        return [], 0.0
+    ref_model = ""
+    ref_tok = -1
+    for m_name, m_stats in usage.get("models_used", {}).items():
+        if m_name == "<synthetic>":
+            continue
+        t = m_stats.get("input_tokens", 0) + m_stats.get("output_tokens", 0)
+        if t > ref_tok:
+            ref_tok = t
+            ref_model = m_name
+    sk_pricing = get_pricing(ref_model)
+    skill_rows: list[tuple[str, int, int, int, float]] = []
+    for sk_name, sk_count in skills_used_ctr.items():
+        st = skills_tokens_d.get(sk_name, {})
+        sk_res = st.get("result_tokens", 0)
+        sk_out = st.get("output_tokens", 0)
+        sk_cost = (sk_res / 1e6) * sk_pricing["input"] + (sk_out / 1e6) * sk_pricing[
+            "output"
+        ]
+        skill_rows.append((sk_name, sk_count, sk_res, sk_out, sk_cost))
+    skill_rows.sort(key=lambda x: x[4], reverse=True)
+    total_cost = sum(c for _, _, _, _, c in skill_rows)
+    return skill_rows, total_cost
+
+
 def build_report(
     hook_event: str,
     hook_input: dict,
@@ -1407,6 +1460,9 @@ def build_report(
     session_events: list | None = None,
     subagent_fallback: bool = False,
     events_log_path: str = "",
+    skills_box: bool = False,
+    max_entries: int = 0,
+    html_report_path: str = "",
 ) -> str:
     """Build a compact unicode-bordered report for terminal display.
 
@@ -1418,6 +1474,17 @@ def build_report(
         events_log_path: Optional filesystem path where all cache events
             were persisted, so users can inspect events beyond the top-5
             shown inline.
+        skills_box: When True, suppress the inline Skills section so the
+            standalone build_skills_box can render the same data on its
+            own without duplication. Driven by the SKILLS_BOX user config.
+        max_entries: Per-section list cap (skills, bash, web, files,
+            sub-agents). 0 = unlimited. Driven by MAX_ENTRIES_PER_SECTION
+            user config. The full untruncated data is always available
+            via the HTML report; when truncated, a "+N more — see HTML"
+            indicator points the reader to the full file.
+        html_report_path: When non-empty, the path is shown in the
+            truncation indicators and as a "Full report:" footer line so
+            the reader can open the complete HTML record.
     """
     is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
     # Show the hook event type as the label for teammate/task events
@@ -1877,68 +1944,68 @@ def build_report(
     # output spent writing the Skill tool-use block). We cost result_tokens at
     # the input rate and output_tokens at the output rate using the session's
     # most-used model as the reference.
-    skills_used_ctr = usage.get("skills_used", Counter())
-    skills_tokens_d = usage.get("skills_tokens", {})
-    if skills_used_ctr:
-        ref_model = ""
-        ref_tok = -1
-        for m_name, m_stats in models_used.items():
-            if m_name == "<synthetic>":
-                continue
-            t = m_stats.get("input_tokens", 0) + m_stats.get("output_tokens", 0)
-            if t > ref_tok:
-                ref_tok = t
-                ref_model = m_name
-        sk_pricing = get_pricing(ref_model)
-        skill_rows: list[tuple[str, int, int, int, float]] = []
-        for sk_name, sk_count in skills_used_ctr.items():
-            st = skills_tokens_d.get(sk_name, {})
-            sk_res = st.get("result_tokens", 0)
-            sk_out = st.get("output_tokens", 0)
-            sk_cost = (sk_res / 1e6) * sk_pricing["input"] + (
-                sk_out / 1e6
-            ) * sk_pricing["output"]
-            skill_rows.append((sk_name, sk_count, sk_res, sk_out, sk_cost))
-        skill_rows.sort(key=lambda x: x[4], reverse=True)
-        total_sk_calls = sum(sk_count for _, sk_count, _, _, _ in skill_rows)
-        rows.append(
-            (
-                "Skills",
-                f"{W}{len(skill_rows)}{R} {S}skills{R} {S}/{R} "
-                f"{G}x{total_sk_calls}{R} {S}calls{R}",
-            )
-        )
-        for sk_name, sk_count, sk_res, sk_out, sk_cost in skill_rows:
-            short_sk = sk_name if len(sk_name) <= 34 else sk_name[:31] + "..."
-            parts = []
-            if sk_res > 0:
-                parts.append(f"{Y}{fmt_tok(sk_res)}{R} {S}result→input{R}")
-            if sk_out > 0:
-                parts.append(f"{Y}{fmt_tok(sk_out)}{R} {S}out{R}")
-            if sk_cost > 0:
-                parts.append(f"{C}${sk_cost:.3f}{R}")
-            detail = f" {S}/{R} ".join(parts) if parts else ""
-            detail_str = f"{S}:{R} {detail}" if detail else ""
+    # Inline Skills section. Suppressed when skills_box=True so the dedicated
+    # build_skills_box (rendered separately by main()) can show the same data
+    # without duplication.
+    if not skills_box:
+        skill_rows, _sk_total_cost = _compute_skill_rows(usage)
+        if skill_rows:
+            total_sk_calls = sum(sk_count for _, sk_count, _, _, _ in skill_rows)
             rows.append(
                 (
-                    "",
-                    f"{S}  L{R} {W}{short_sk}{R} {G}x{sk_count}{R}{detail_str}",
+                    "Skills",
+                    f"{W}{len(skill_rows)}{R} {S}skills{R} {S}/{R} "
+                    f"{G}x{total_sk_calls}{R} {S}calls{R}",
                 )
             )
+            shown_skills, hidden_skills = _cap_list(skill_rows, max_entries)
+            for sk_name, sk_count, sk_res, sk_out, sk_cost in shown_skills:
+                short_sk = sk_name if len(sk_name) <= 34 else sk_name[:31] + "..."
+                parts = []
+                if sk_res > 0:
+                    parts.append(f"{Y}{fmt_tok(sk_res)}{R} {S}result→input{R}")
+                if sk_out > 0:
+                    parts.append(f"{Y}{fmt_tok(sk_out)}{R} {S}out{R}")
+                if sk_cost > 0:
+                    parts.append(f"{C}${sk_cost:.3f}{R}")
+                detail = f" {S}/{R} ".join(parts) if parts else ""
+                detail_str = f"{S}:{R} {detail}" if detail else ""
+                rows.append(
+                    (
+                        "",
+                        f"{S}  L{R} {W}{short_sk}{R} {G}x{sk_count}{R}{detail_str}",
+                    )
+                )
+            if hidden_skills:
+                more_hint = " — see HTML report" if html_report_path else ""
+                rows.append(
+                    (
+                        "",
+                        f"{S}  ⋯ +{hidden_skills} more{more_hint}{R}",
+                    )
+                )
 
-    # Bash commands executed
+    # Bash commands executed (capped to keep inline output under hook cap)
     bash_cmds = usage.get("bash_commands", [])
     if bash_cmds:
         rows.append(("Bash", f"{W}{len(bash_cmds)}{R} {S}commands{R}"))
-        for cmd in bash_cmds:
+        shown_bash, hidden_bash = _cap_list(bash_cmds, max_entries)
+        for cmd in shown_bash:
             rows.append(("", f"  {S}${R} {W}{cmd}{R}"))
+        if hidden_bash:
+            more_hint = " — see HTML report" if html_report_path else ""
+            rows.append(("", f"{S}  ⋯ +{hidden_bash} more{more_hint}{R}"))
 
     # Web fetches
     web_fetches = usage.get("web_fetches", [])
     if web_fetches:
         rows.append(("Web", f"{W}{len(web_fetches)}{R} {S}fetches{R}"))
-        for url in web_fetches:
+        shown_web, hidden_web = _cap_list(web_fetches, max_entries)
+        for url in shown_web:
             rows.append(("", f"  {S}→{R} {W}{url}{R}"))
+        if hidden_web:
+            more_hint = " — see HTML report" if html_report_path else ""
+            rows.append(("", f"{S}  ⋯ +{hidden_web} more{more_hint}{R}"))
 
     # Files summary (counts bright, labels static)
     file_parts = []
@@ -1951,17 +2018,29 @@ def build_report(
     if file_parts:
         rows.append(("Files", f" {S}/{R} ".join(file_parts)))
 
-    # List all edited files
-    for f in fe:
+    # List edited files (capped) — edited matters most for correctness review
+    shown_fe, hidden_fe = _cap_list(fe, max_entries)
+    for f in shown_fe:
         rows.append(("", f"  {S}*{R} {W}{f}{R}"))
+    if hidden_fe:
+        more_hint = " — see HTML report" if html_report_path else ""
+        rows.append(("", f"{S}  ⋯ +{hidden_fe} more edited{more_hint}{R}"))
 
-    # List all written files
-    for f in fw:
+    # List written files (capped)
+    shown_fw, hidden_fw = _cap_list(fw, max_entries)
+    for f in shown_fw:
         rows.append(("", f"  {S}+{R} {W}{f}{R}"))
+    if hidden_fw:
+        more_hint = " — see HTML report" if html_report_path else ""
+        rows.append(("", f"{S}  ⋯ +{hidden_fw} more written{more_hint}{R}"))
 
-    # List all read files
-    for f in fr:
+    # List read files (capped)
+    shown_fr, hidden_fr = _cap_list(fr, max_entries)
+    for f in shown_fr:
         rows.append(("", f"  {S}·{R} {W}{f}{R}"))
+    if hidden_fr:
+        more_hint = " — see HTML report" if html_report_path else ""
+        rows.append(("", f"{S}  ⋯ +{hidden_fr} more read{more_hint}{R}"))
 
     # Subagent task description — no truncation
     if is_sub:
@@ -2032,7 +2111,10 @@ def build_report(
                     )
                 )
 
-        for sa_info, sa_usage in sub_usage_list:
+        # Per-instance drill-down (capped). The "by type" aggregation above
+        # is the unbounded summary; this is the detailed list.
+        shown_subs, hidden_subs = _cap_list(sub_usage_list, max_entries)
+        for sa_info, sa_usage in shown_subs:
             sa_type = sa_info.get("agent_type", "")
             sa_desc = sa_info.get("description", "")
             sa_label = sa_type or sa_desc or sa_info["agent_id"][:12]
@@ -2053,8 +2135,525 @@ def build_report(
                     f"{cost_str}",
                 )
             )
+        if hidden_subs:
+            more_hint = " — see HTML report" if html_report_path else ""
+            rows.append(("", f"{S}  ⋯ +{hidden_subs} more sub-agents{more_hint}{R}"))
+
+    # Footer: HTML report path so the reader can open the full record.
+    if html_report_path:
+        rows.append(("", f"{S}Full report:{R} {H}{html_report_path}{R}"))
 
     return _render_box(rows)
+
+
+def build_skills_box(
+    usage: dict,
+    max_entries: int = 0,
+    html_report_path: str = "",
+) -> str:
+    """Build a standalone unicode-bordered box containing only per-skill costs.
+
+    Returns "" if no skills were invoked, so the caller can append the result
+    unconditionally without producing an empty box. The contents mirror the
+    inline Skills section of build_report (same _compute_skill_rows helper)
+    but in a self-contained box that can be displayed beside or below the
+    main report.
+
+    Args:
+        max_entries: Per-section cap. When >0 and the skill list exceeds it,
+            only the top N (by cost) are shown and a "+N more" indicator
+            row is appended pointing at the HTML report (if provided).
+        html_report_path: Optional HTML report path shown in the truncation
+            indicator so the reader knows where the full data lives.
+
+    Header shows: skill count / total invocations / total estimated cost.
+    Body shows: one row per skill (sorted by cost descending) with
+    invocation count, result→input bytes, output bytes, and per-skill cost.
+    """
+    skill_rows, total_cost = _compute_skill_rows(usage)
+    if not skill_rows:
+        return ""
+
+    # ANSI palette — match build_report so the two boxes look uniform side
+    # by side. These are local rather than module-level so the existing
+    # palette duplication pattern in build_report / build_worktree_report
+    # stays consistent (same constants, no shared globals).
+    S = "\033[94m"
+    Y = "\033[93m"
+    C = "\033[92m"
+    G = "\033[95m"
+    H = "\033[96m"
+    W = "\033[97m"
+    R = "\033[0m"
+
+    rows: list[str | tuple[str, str]] = []
+
+    total_calls = sum(sk_count for _, sk_count, _, _, _ in skill_rows)
+    rows.append(
+        f"{S}Skills{R} {H}breakdown{R} {S}|{R} "
+        f"{W}{len(skill_rows)}{R} {S}skills{R} {S}|{R} "
+        f"{G}x{total_calls}{R} {S}calls{R} {S}|{R} "
+        f"{C}${total_cost:.4f}{R}"
+    )
+
+    shown_skills, hidden_skills = _cap_list(skill_rows, max_entries)
+    for sk_name, sk_count, sk_res, sk_out, sk_cost in shown_skills:
+        # Truncate the displayed name but keep the full identifier in the
+        # box header — the stripped suffix is rare and not informative for
+        # cost attribution (the prefix is the namespace that matters).
+        short_sk = sk_name if len(sk_name) <= 38 else sk_name[:35] + "..."
+        rows.append(("", f"{S}>{R} {W}{short_sk}{R} {G}x{sk_count}{R}"))
+        parts = []
+        if sk_res > 0:
+            parts.append(f"{Y}{fmt_tok(sk_res)}{R} {S}result→input{R}")
+        if sk_out > 0:
+            parts.append(f"{Y}{fmt_tok(sk_out)}{R} {S}out{R}")
+        cost_str = f" {C}${sk_cost:.4f}{R}" if sk_cost > 0 else ""
+        detail = f" {S}/{R} ".join(parts) if parts else ""
+        if detail or cost_str:
+            rows.append(("", f"  {detail}{cost_str}"))
+    if hidden_skills:
+        more_hint = " — see HTML report" if html_report_path else ""
+        rows.append(("", f"{S}⋯ +{hidden_skills} more skills{more_hint}{R}"))
+    if html_report_path:
+        rows.append(("", f"{S}Full report:{R} {H}{html_report_path}{R}"))
+
+    return _render_box(rows)
+
+
+# ─────────────────────────────────────────────
+# HTML report writer
+# ─────────────────────────────────────────────
+
+# Self-contained CSS — no external fonts/JS so the report works offline.
+_HTML_CSS = """\
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+       sans-serif; margin: 0; padding: 24px; background: #0d1117; color: #c9d1d9; }
+h1 { color: #58a6ff; border-bottom: 2px solid #30363d; padding-bottom: 8px; }
+h2 { color: #79c0ff; margin-top: 32px; border-bottom: 1px solid #30363d;
+     padding-bottom: 4px; }
+h3 { color: #a5d6ff; margin-top: 20px; }
+table { border-collapse: collapse; margin: 12px 0; width: 100%; }
+th, td { border: 1px solid #30363d; padding: 6px 10px; text-align: left;
+         vertical-align: top; }
+th { background: #161b22; color: #f0f6fc; font-weight: 600;
+     position: sticky; top: 0; }
+tr:nth-child(even) { background: #161b22; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.cost { color: #7ee787; font-weight: 600; }
+.warn { color: #f85149; }
+.ok { color: #56d364; }
+.muted { color: #6e7681; font-size: 0.9em; }
+.path { font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+        font-size: 0.85em; color: #a5d6ff; word-break: break-all; }
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+           gap: 12px; margin: 16px 0; }
+.summary-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+                padding: 12px 16px; }
+.summary-card .label { color: #8b949e; font-size: 0.8em; text-transform: uppercase;
+                       letter-spacing: 0.5px; }
+.summary-card .value { color: #f0f6fc; font-size: 1.4em; font-weight: 600;
+                       margin-top: 4px; font-variant-numeric: tabular-nums; }
+ul { padding-left: 20px; }
+li { margin: 2px 0; }
+code { font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace;
+       background: #161b22; padding: 1px 5px; border-radius: 3px; font-size: 0.9em; }
+.footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid #30363d;
+          color: #6e7681; font-size: 0.85em; }
+"""
+
+
+def _html_escape(s: object) -> str:
+    """HTML-escape arbitrary content. None/numbers are stringified first."""
+    import html
+
+    return html.escape(str(s), quote=True)
+
+
+def _html_section_table(
+    title: str,
+    headers: list[str],
+    rows: list[list[str]],
+    notes: str = "",
+) -> str:
+    """Render one HTML section with a table. Returns "" if rows is empty."""
+    if not rows:
+        return ""
+    parts = [f"<h2>{_html_escape(title)}</h2>"]
+    if notes:
+        parts.append(f'<p class="muted">{_html_escape(notes)}</p>')
+    parts.append("<table>")
+    parts.append(
+        "<thead><tr>"
+        + "".join(f"<th>{_html_escape(h)}</th>" for h in headers)
+        + "</tr></thead>"
+    )
+    parts.append("<tbody>")
+    for row in rows:
+        parts.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
+    parts.append("</tbody></table>")
+    return "\n".join(parts)
+
+
+def _format_html_report(
+    usage: dict,
+    sub_usage_list: list | None,
+    hook_event: str,
+    hook_input: dict,
+    identity: dict,
+) -> str:
+    """Render a full HTML report (no truncation) for the current session.
+
+    Mirrors every section of build_report but without the Claude Code hook
+    output cap, so the user has the complete record to dig through after
+    the inline box has already been displayed.
+    """
+    from datetime import datetime
+
+    sid = hook_input.get("session_id", "") or hook_input.get("agent_id", "")
+    cwd = hook_input.get("cwd", "")
+    models_used = usage.get("models_used", {})
+    real_models = {m: s for m, s in models_used.items() if m != "<synthetic>"}
+    total_cost = sum(estimate_cost(s, m) for m, s in real_models.items())
+    model_names = ", ".join(shorten_model(m) for m in real_models.keys()) or "unknown"
+
+    inp = usage.get("input_tokens", 0)
+    out = usage.get("output_tokens", 0)
+    cw = usage.get("cache_creation_input_tokens", 0)
+    cr = usage.get("cache_read_input_tokens", 0)
+    msgs = usage.get("message_count", 0)
+    total_in = inp + cw + cr
+    cache_eff = (cr / total_in * 100) if total_in > 0 else 0.0
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    title = f"token-reporter — {hook_event} {sid[:8]}"
+
+    parts = [
+        "<!DOCTYPE html>",
+        '<html lang="en"><head><meta charset="utf-8">',
+        f"<title>{_html_escape(title)}</title>",
+        f"<style>{_HTML_CSS}</style>",
+        "</head><body>",
+        f"<h1>{_html_escape(title)}</h1>",
+        f'<p class="muted">Generated {_html_escape(now_iso)} · '
+        f"cwd <code>{_html_escape(cwd)}</code></p>",
+    ]
+
+    # Summary cards
+    parts.append('<div class="summary">')
+    parts.append(
+        '<div class="summary-card"><div class="label">Models</div>'
+        f'<div class="value">{_html_escape(model_names)}</div></div>'
+    )
+    parts.append(
+        '<div class="summary-card"><div class="label">Messages</div>'
+        f'<div class="value">{msgs}</div></div>'
+    )
+    parts.append(
+        '<div class="summary-card"><div class="label">Input tokens</div>'
+        f'<div class="value">{inp + cw:,}</div></div>'
+    )
+    parts.append(
+        '<div class="summary-card"><div class="label">Output tokens</div>'
+        f'<div class="value">{out:,}</div></div>'
+    )
+    parts.append(
+        '<div class="summary-card"><div class="label">Cache efficiency</div>'
+        f'<div class="value">{cache_eff:.0f}%</div></div>'
+    )
+    parts.append(
+        '<div class="summary-card"><div class="label">Total cost</div>'
+        f'<div class="value cost">${total_cost:.4f}</div></div>'
+    )
+    parts.append("</div>")
+
+    # Token breakdown
+    parts.append(
+        _html_section_table(
+            "Token breakdown",
+            ["Field", "Tokens", "Notes"],
+            [
+                [
+                    "Fresh input",
+                    f'<span class="num">{inp:,}</span>',
+                    "New tokens entering context",
+                ],
+                [
+                    "Cache-write",
+                    f'<span class="num">{cw:,}</span>',
+                    "Billed at 1.25x, included in rate limits",
+                ],
+                [
+                    "Cache-read",
+                    f'<span class="num">{cr:,}</span>',
+                    "Billed at 0.1x, excluded from rate limits",
+                ],
+                [
+                    "Output",
+                    f'<span class="num">{out:,}</span>',
+                    "Model-generated tokens",
+                ],
+            ],
+        )
+    )
+
+    # Per-model breakdown
+    if real_models:
+        m_rows = []
+        for m_name, m_stats in sorted(
+            real_models.items(),
+            key=lambda kv: -estimate_cost(kv[1], kv[0]),
+        ):
+            m_cost = estimate_cost(m_stats, m_name)
+            m_inp = m_stats.get("input_tokens", 0)
+            m_out = m_stats.get("output_tokens", 0)
+            m_cw = m_stats.get("cache_creation_input_tokens", 0)
+            m_cr = m_stats.get("cache_read_input_tokens", 0)
+            m_msg = m_stats.get("message_count", 0)
+            m_rows.append(
+                [
+                    f"<code>{_html_escape(m_name)}</code>",
+                    f'<span class="num">{m_inp:,}</span>',
+                    f'<span class="num">{m_out:,}</span>',
+                    f'<span class="num">{m_cw:,}</span>',
+                    f'<span class="num">{m_cr:,}</span>',
+                    f'<span class="num">{m_msg}</span>',
+                    f'<span class="cost">${m_cost:.4f}</span>',
+                ]
+            )
+        parts.append(
+            _html_section_table(
+                "Models used",
+                [
+                    "Model",
+                    "Input",
+                    "Output",
+                    "Cache write",
+                    "Cache read",
+                    "Msgs",
+                    "Cost",
+                ],
+                m_rows,
+            )
+        )
+
+    # Tools
+    tools = usage.get("tools_used", {})
+    tools_tokens = usage.get("tools_tokens", {})
+    if tools:
+        all_tools = (
+            tools.most_common()
+            if hasattr(tools, "most_common")
+            else sorted(tools.items(), key=lambda x: -x[1])
+        )
+        t_rows = []
+        for t, c in all_tools:
+            tt = tools_tokens.get(t, {})
+            t_rows.append(
+                [
+                    f"<code>{_html_escape(t)}</code>",
+                    f'<span class="num">{c}</span>',
+                    f'<span class="num">{tt.get("input", 0):,}</span>',
+                    f'<span class="num">{tt.get("output", 0):,}</span>',
+                    f'<span class="num">{tt.get("result_tokens", 0):,}</span>',
+                ]
+            )
+        parts.append(
+            _html_section_table(
+                "Tools",
+                ["Tool", "Calls", "Input", "Output", "Result→Input"],
+                t_rows,
+            )
+        )
+
+    # Skills (full, no truncation)
+    skill_rows, sk_total = _compute_skill_rows(usage)
+    if skill_rows:
+        s_rows = []
+        for sk_name, sk_count, sk_res, sk_out, sk_cost in skill_rows:
+            s_rows.append(
+                [
+                    f"<code>{_html_escape(sk_name)}</code>",
+                    f'<span class="num">{sk_count}</span>',
+                    f'<span class="num">{sk_res:,}</span>',
+                    f'<span class="num">{sk_out:,}</span>',
+                    f'<span class="cost">${sk_cost:.4f}</span>',
+                ]
+            )
+        parts.append(
+            _html_section_table(
+                f"Skills (total ${sk_total:.4f})",
+                ["Skill", "Invocations", "Result→Input", "Output", "Cost"],
+                s_rows,
+                notes="Sorted by cost descending. v2.1.108+ built-in slash "
+                "commands route through the Skill tool.",
+            )
+        )
+
+    # Sub-agents
+    if sub_usage_list:
+        # Type aggregation
+        type_agg: dict[str, dict[str, float]] = {}
+        for sa_info, sa_usage in sub_usage_list:
+            sa_type = sa_info.get("agent_type", "") or "untyped"
+            if sa_type not in type_agg:
+                type_agg[sa_type] = {"count": 0, "inp": 0, "out": 0, "cost": 0.0}
+            type_agg[sa_type]["count"] += 1
+            type_agg[sa_type]["inp"] += (
+                sa_usage["input_tokens"] + sa_usage["cache_creation_input_tokens"]
+            )
+            type_agg[sa_type]["out"] += sa_usage["output_tokens"]
+            type_agg[sa_type]["cost"] += sum(
+                estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items()
+            )
+        agg_rows = []
+        for tname, ts in sorted(type_agg.items(), key=lambda kv: -kv[1]["cost"]):
+            agg_rows.append(
+                [
+                    f"<code>{_html_escape(tname)}</code>",
+                    f'<span class="num">{int(ts["count"])}</span>',
+                    f'<span class="num">{int(ts["inp"]):,}</span>',
+                    f'<span class="num">{int(ts["out"]):,}</span>',
+                    f'<span class="cost">${ts["cost"]:.4f}</span>',
+                ]
+            )
+        parts.append(
+            _html_section_table(
+                "Sub-agents by type",
+                ["Type", "Count", "Input", "Output", "Cost"],
+                agg_rows,
+            )
+        )
+        # Per-instance drill-down
+        sa_rows = []
+        for sa_info, sa_usage in sub_usage_list:
+            sa_label = (
+                sa_info.get("agent_type", "")
+                or sa_info.get("description", "")
+                or sa_info.get("agent_id", "?")[:12]
+            )
+            sa_inp = sa_usage["input_tokens"] + sa_usage["cache_creation_input_tokens"]
+            sa_out = sa_usage["output_tokens"]
+            sa_cost = sum(
+                estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items()
+            )
+            sa_rows.append(
+                [
+                    f"<code>{_html_escape(sa_info.get('agent_id', '')[:12])}</code>",
+                    _html_escape(sa_label),
+                    f'<span class="num">{sa_inp:,}</span>',
+                    f'<span class="num">{sa_out:,}</span>',
+                    f'<span class="num">{sa_usage.get("message_count", 0)}</span>',
+                    f'<span class="cost">${sa_cost:.4f}</span>',
+                ]
+            )
+        parts.append(
+            _html_section_table(
+                "Sub-agents (per-instance)",
+                ["Agent ID", "Type / Description", "Input", "Output", "Msgs", "Cost"],
+                sa_rows,
+            )
+        )
+
+    # Bash commands
+    bash_cmds = usage.get("bash_commands", [])
+    if bash_cmds:
+        parts.append(f"<h2>Bash commands ({len(bash_cmds)})</h2><ul>")
+        for cmd in bash_cmds:
+            parts.append(f"<li><code>{_html_escape(cmd)}</code></li>")
+        parts.append("</ul>")
+
+    # Web fetches
+    web_fetches = usage.get("web_fetches", [])
+    if web_fetches:
+        parts.append(f"<h2>Web fetches ({len(web_fetches)})</h2><ul>")
+        for url in web_fetches:
+            parts.append(f'<li><span class="path">{_html_escape(url)}</span></li>')
+        parts.append("</ul>")
+
+    # Files
+    fr = list(usage.get("files_read", []))
+    fe = list(usage.get("files_edited", []))
+    fw = list(usage.get("files_written", []))
+    if fr or fe or fw:
+        parts.append("<h2>Files touched</h2>")
+        for label, files in [
+            ("Edited", fe),
+            ("Written", fw),
+            ("Read", fr),
+        ]:
+            if not files:
+                continue
+            parts.append(f"<h3>{label} ({len(files)})</h3><ul>")
+            for f in files:
+                parts.append(f'<li><span class="path">{_html_escape(f)}</span></li>')
+            parts.append("</ul>")
+
+    # Cache events
+    cache_events = usage.get("cache_events", [])
+    if cache_events:
+        ce_rows = []
+        for ev in cache_events:
+            ce_rows.append(
+                [
+                    _html_escape(ev.get("timestamp", "")),
+                    _html_escape(ev.get("cause", "")),
+                    f'<span class="num">{ev.get("cache_write_tokens", 0):,}</span>',
+                    f'<span class="cost">${ev.get("cost", 0):.4f}</span>',
+                    f'<span class="warn">${ev.get("saved_if_cached", 0):.4f}</span>',
+                ]
+            )
+        parts.append(
+            _html_section_table(
+                f"Cache invalidation events ({len(cache_events)})",
+                ["Timestamp", "Cause", "Tokens resent", "Cost", "Penalty"],
+                ce_rows,
+                notes="Each row is a cache miss that forced the full context "
+                "to be re-sent at cache_write rates instead of cache_read.",
+            )
+        )
+
+    # Footer
+    sid_html = _html_escape(sid)
+    event_html = _html_escape(hook_event)
+    parts.append(
+        f'<div class="footer">token-reporter · session <code>{sid_html}</code>'
+        f" · hook <code>{event_html}</code></div>"
+    )
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+def _write_html_report(
+    html_content: str,
+    session_id: str,
+    hook_event: str,
+    cwd: str = "",
+) -> str:
+    """Write the HTML report to a stable on-disk location and return the path.
+
+    Storage layout:
+      ~/.claude/token-reporter-html/<project-slug>/<timestamp>-<event>.html
+
+    The directory is created if missing. On any I/O failure the function
+    returns an empty string so the caller can fall back to no-link mode
+    instead of crashing the hook.
+    """
+    try:
+        slug = (
+            re.sub(r"[^A-Za-z0-9_-]", "_", Path(cwd).name)[:48] if cwd else "default"
+        ) or "default"
+        out_dir = Path.home() / ".claude" / "token-reporter-html" / slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", session_id[:12]) or "nosession"
+        safe_event = re.sub(r"[^A-Za-z0-9_-]", "_", hook_event) or "event"
+        out_path = out_dir / f"{ts}-{safe_event}-{safe_sid}.html"
+        out_path.write_text(html_content, encoding="utf-8")
+        return str(out_path)
+    except OSError as e:
+        dbg(f"failed to write HTML report: {e}")
+        return ""
 
 
 def build_worktree_report(
@@ -2784,7 +3383,62 @@ def main():
             dbg(f"failed to persist cache events: {e}")
             events_log_path = None
 
-    # Step 4: Build report (pass sub_usage_list for summary in main box)
+    # User config: SKILLS_BOX (bool), HTML_REPORT (bool, default true),
+    # MAX_ENTRIES_PER_SECTION (int, default 12). The TOKEN_REPORTER_* env vars
+    # are dev overrides that take precedence over CLAUDE_PLUGIN_OPTION_*.
+    def _truthy(s: str) -> bool:
+        return s.strip().lower() in ("1", "true", "yes", "on")
+
+    def _falsy(s: str) -> bool:
+        return s.strip().lower() in ("0", "false", "no", "off")
+
+    skills_box_enabled = _truthy(
+        os.environ.get("TOKEN_REPORTER_SKILLS_BOX")
+        or os.environ.get("CLAUDE_PLUGIN_OPTION_SKILLS_BOX")
+        or ""
+    )
+
+    # HTML_REPORT defaults ON. Disable only when explicitly set to a falsy
+    # value, otherwise an unset env var should still produce the report.
+    html_report_raw = (
+        os.environ.get("TOKEN_REPORTER_HTML_REPORT")
+        if os.environ.get("TOKEN_REPORTER_HTML_REPORT") is not None
+        else os.environ.get("CLAUDE_PLUGIN_OPTION_HTML_REPORT")
+    )
+    html_report_enabled = not _falsy(html_report_raw or "")
+
+    def _resolve_max_entries() -> int:
+        raw = (
+            os.environ.get("TOKEN_REPORTER_MAX_ENTRIES_PER_SECTION")
+            or os.environ.get("CLAUDE_PLUGIN_OPTION_MAX_ENTRIES_PER_SECTION")
+            or ""
+        )
+        try:
+            n = int(raw)
+            return n if n >= 0 else 12
+        except ValueError:
+            return 12
+
+    max_entries = _resolve_max_entries()
+    dbg(
+        f"skills_box={skills_box_enabled} html_report={html_report_enabled} "
+        f"max_entries={max_entries}"
+    )
+
+    # Step 4: Write the full HTML report to disk (if enabled) BEFORE building
+    # the inline report, so build_report can include the HTML path in its
+    # truncation indicators and footer.
+    html_path = ""
+    if html_report_enabled:
+        html_doc = _format_html_report(
+            usage, sub_usage_list, hook_event, hook_input, identity
+        )
+        html_path = _write_html_report(
+            html_doc, session_id, hook_event, cwd=hook_input.get("cwd", "")
+        )
+        dbg(f"html report path: {html_path or '(failed)'}")
+
+    # Step 4b: Build inline report (pass sub_usage_list for summary in main box)
     report = build_report(
         hook_event,
         hook_input,
@@ -2794,10 +3448,25 @@ def main():
         session_events=session_events,
         subagent_fallback=subagent_fallback,
         events_log_path=str(events_log_path) if events_log_path else "",
+        skills_box=skills_box_enabled,
+        max_entries=max_entries,
+        html_report_path=html_path,
     )
     dbg(f"report built, length={len(report)}")
 
-    # Step 3b: Build dedicated worktree box if sub-agents were found.
+    # Step 4c: If SKILLS_BOX is enabled and the session invoked any skills,
+    # append a dedicated standalone box. The inline Skills section was
+    # suppressed in build_report above (skills_box=True) so this is the only
+    # place skills are reported when the option is on.
+    if skills_box_enabled:
+        sk_box = build_skills_box(
+            usage, max_entries=max_entries, html_report_path=html_path
+        )
+        if sk_box:
+            report = report + "\n" + sk_box
+            dbg(f"skills box appended, total length={len(report)}")
+
+    # Step 4c: Build dedicated worktree box if sub-agents were found.
     # Box 1 (above) shows the total. Box 2 shows the detailed per-agent
     # cache dynamics — cache invalidation, efficiency per agent, penalty cost.
     if sub_usage_list:
