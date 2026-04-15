@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.8.1] - 2026-04-15
+
+
+### Bug Fixes
+
+- Harden against scan-identified bugs
+- Cross-platform launcher and bumper hardening
+- Tighten release pipeline against latent failures
+
+
+### Miscellaneous
+
+- Tighten hooks.json, README, and CI workflow
+- Sync uv.lock to 1.8.0
+
 ## [1.8.0] - 2026-04-15
 
 
