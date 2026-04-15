@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.9.1] - 2026-04-15
+
+
+### Bug Fixes
+
+- Save HTML report in project ./reports/token-reporter/
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.9.0
+
 ## [1.9.0] - 2026-04-15
 
 
