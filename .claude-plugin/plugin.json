@@ -41,13 +41,7 @@
       "type": "number",
       "title": "Max entries per section in inline output",
       "default": 12,
-      "description": "Lists in the inline boxes (skills, bash commands, web fetches, files, sub-agents) are capped at this many entries, with a '+N more — see HTML report' indicator when truncated. The full untruncated data is always available in the HTML report file. Set to 0 to disable truncation entirely."
-    },
-    "HTML_REPORT": {
-      "type": "boolean",
-      "title": "Save full HTML report to disk",
-      "default": true,
-      "description": "Write a full nicely-formatted HTML report with all sections (no truncation) to ~/.claude/token-reporter-html/ and append the file path to the inline output. Disable if you only want the inline box and don't need the full record."
+      "description": "Lists in the inline boxes (skills, bash commands, web fetches, files, sub-agents) are capped at this many entries, with a '+N more — see HTML report' indicator when truncated. The full untruncated data is always available in the HTML report file at ./reports/token-reporter/. Set to 0 to disable truncation entirely."
     }
   }
 }

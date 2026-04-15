@@ -2630,20 +2630,26 @@ def _write_html_report(
     hook_event: str,
     cwd: str = "",
 ) -> str:
-    """Write the HTML report to a stable on-disk location and return the path.
+    """Write the HTML report inside the project folder and return the path.
 
-    Storage layout:
-      ~/.claude/token-reporter-html/<project-slug>/<timestamp>-<event>.html
+    Storage layout (per the convention shared across the user's plugins):
+      <cwd>/reports/token-reporter/<timestamp>-<event>-<session>.html
 
-    The directory is created if missing. On any I/O failure the function
+    The hook only runs in debug mode, so the project gets a complete debug
+    archive of every box that was rendered for inspection / diffing later.
+    The reports/ subdirectory is created if missing — the user is expected
+    to add `reports/` (or `reports/token-reporter/`) to their .gitignore so
+    the archive doesn't pollute commits.
+
+    On any I/O failure (no cwd, read-only filesystem, etc.) the function
     returns an empty string so the caller can fall back to no-link mode
     instead of crashing the hook.
     """
+    if not cwd:
+        dbg("no cwd in hook input — skipping HTML report")
+        return ""
     try:
-        slug = (
-            re.sub(r"[^A-Za-z0-9_-]", "_", Path(cwd).name)[:48] if cwd else "default"
-        ) or "default"
-        out_dir = Path.home() / ".claude" / "token-reporter-html" / slug
+        out_dir = Path(cwd) / "reports" / "token-reporter"
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d-%H%M%S")
         safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", session_id[:12]) or "nosession"
@@ -2652,7 +2658,7 @@ def _write_html_report(
         out_path.write_text(html_content, encoding="utf-8")
         return str(out_path)
     except OSError as e:
-        dbg(f"failed to write HTML report: {e}")
+        dbg(f"failed to write HTML report to {cwd}/reports/token-reporter: {e}")
         return ""
 
 
@@ -2660,6 +2666,7 @@ def build_worktree_report(
     worktree_path: str,
     orchestrator_usage: dict,
     sub_usage_list: list,
+    html_report_path: str = "",
 ) -> str:
     """Build a detailed worktree breakdown box showing per-agent cache dynamics.
 
@@ -2668,6 +2675,12 @@ def build_worktree_report(
     re-send context as cache_creation tokens (1.25x price) instead of cache_read
     (0.1x price). Agents that share context with the parent can reuse the cache.
     This report makes those dynamics visible.
+
+    Args:
+        html_report_path: When non-empty, shown in the box's last row as a
+            "Full report:" footer line so the reader can open the complete
+            HTML record. Caller is expected to pass a project-relative path
+            (e.g. "./reports/token-reporter/...").
     """
     # ANSI palette (same as build_report)
     S = "\033[94m"
@@ -3010,6 +3023,10 @@ def build_worktree_report(
             short_sk = sk_name if len(sk_name) <= 34 else sk_name[:31] + "..."
             cost_str = f" {C}${sk_cost:.4f}{R}" if sk_cost > 0 else ""
             rows.append(("", f"  {S}L{R} {W}{short_sk}{R} {G}x{sk_count}{R}{cost_str}"))
+
+    # Footer: HTML report path so the reader can open the full record.
+    if html_report_path:
+        rows.append(("", f"{S}Full report:{R} {H}{html_report_path}{R}"))
 
     return _render_box(rows)
 
@@ -3383,29 +3400,18 @@ def main():
             dbg(f"failed to persist cache events: {e}")
             events_log_path = None
 
-    # User config: SKILLS_BOX (bool), HTML_REPORT (bool, default true),
-    # MAX_ENTRIES_PER_SECTION (int, default 12). The TOKEN_REPORTER_* env vars
-    # are dev overrides that take precedence over CLAUDE_PLUGIN_OPTION_*.
+    # User config: SKILLS_BOX (bool), MAX_ENTRIES_PER_SECTION (int, default 12).
+    # The TOKEN_REPORTER_* env vars are dev overrides that take precedence
+    # over CLAUDE_PLUGIN_OPTION_*. The HTML report is unconditional in debug
+    # mode (see Step 4 below) so users always get a tracking archive.
     def _truthy(s: str) -> bool:
         return s.strip().lower() in ("1", "true", "yes", "on")
-
-    def _falsy(s: str) -> bool:
-        return s.strip().lower() in ("0", "false", "no", "off")
 
     skills_box_enabled = _truthy(
         os.environ.get("TOKEN_REPORTER_SKILLS_BOX")
         or os.environ.get("CLAUDE_PLUGIN_OPTION_SKILLS_BOX")
         or ""
     )
-
-    # HTML_REPORT defaults ON. Disable only when explicitly set to a falsy
-    # value, otherwise an unset env var should still produce the report.
-    html_report_raw = (
-        os.environ.get("TOKEN_REPORTER_HTML_REPORT")
-        if os.environ.get("TOKEN_REPORTER_HTML_REPORT") is not None
-        else os.environ.get("CLAUDE_PLUGIN_OPTION_HTML_REPORT")
-    )
-    html_report_enabled = not _falsy(html_report_raw or "")
 
     def _resolve_max_entries() -> int:
         raw = (
@@ -3420,23 +3426,34 @@ def main():
             return 12
 
     max_entries = _resolve_max_entries()
-    dbg(
-        f"skills_box={skills_box_enabled} html_report={html_report_enabled} "
-        f"max_entries={max_entries}"
-    )
+    dbg(f"skills_box={skills_box_enabled} max_entries={max_entries}")
 
-    # Step 4: Write the full HTML report to disk (if enabled) BEFORE building
-    # the inline report, so build_report can include the HTML path in its
-    # truncation indicators and footer.
-    html_path = ""
-    if html_report_enabled:
-        html_doc = _format_html_report(
-            usage, sub_usage_list, hook_event, hook_input, identity
-        )
-        html_path = _write_html_report(
-            html_doc, session_id, hook_event, cwd=hook_input.get("cwd", "")
-        )
-        dbg(f"html report path: {html_path or '(failed)'}")
+    # Step 4: Always write the full HTML report to disk. The hook only runs
+    # when Claude is in --debug mode, so this gives the user a complete debug
+    # archive of every box that was rendered. We do this BEFORE building the
+    # inline report so build_report can include the HTML path in its
+    # truncation indicators and footer line.
+    cwd_for_html = hook_input.get("cwd", "")
+    html_doc = _format_html_report(
+        usage, sub_usage_list, hook_event, hook_input, identity
+    )
+    html_path = _write_html_report(html_doc, session_id, hook_event, cwd=cwd_for_html)
+    dbg(f"html report path: {html_path or '(failed)'}")
+
+    # Compute the project-relative path for display in the inline boxes. The
+    # absolute path is kept for filesystem ops, but the boxes show a short
+    # `./reports/token-reporter/<file>.html` so it stays inside the box width
+    # and matches the project-folder convention. When the path can't be made
+    # relative (different filesystem root, etc.) we fall back to the absolute.
+    html_path_display = ""
+    if html_path:
+        try:
+            rel = os.path.relpath(html_path, cwd_for_html) if cwd_for_html else ""
+            html_path_display = (
+                f"./{rel}" if rel and not rel.startswith("..") else html_path
+            )
+        except ValueError:
+            html_path_display = html_path
 
     # Step 4b: Build inline report (pass sub_usage_list for summary in main box)
     report = build_report(
@@ -3450,7 +3467,7 @@ def main():
         events_log_path=str(events_log_path) if events_log_path else "",
         skills_box=skills_box_enabled,
         max_entries=max_entries,
-        html_report_path=html_path,
+        html_report_path=html_path_display,
     )
     dbg(f"report built, length={len(report)}")
 
@@ -3460,20 +3477,24 @@ def main():
     # place skills are reported when the option is on.
     if skills_box_enabled:
         sk_box = build_skills_box(
-            usage, max_entries=max_entries, html_report_path=html_path
+            usage, max_entries=max_entries, html_report_path=html_path_display
         )
         if sk_box:
             report = report + "\n" + sk_box
             dbg(f"skills box appended, total length={len(report)}")
 
-    # Step 4c: Build dedicated worktree box if sub-agents were found.
+    # Step 4d: Build dedicated worktree box if sub-agents were found.
     # Box 1 (above) shows the total. Box 2 shows the detailed per-agent
     # cache dynamics — cache invalidation, efficiency per agent, penalty cost.
+    # The HTML path is also shown in this box's last row so each box is
+    # self-contained.
     if sub_usage_list:
         # Orchestrator's own usage = total minus all sub-agents
         orch_usage = parse_agent_transcript(active_transcript, session_id="")
         wt_path = hook_input.get("cwd", active_transcript)
-        wt_report = build_worktree_report(wt_path, orch_usage, sub_usage_list)
+        wt_report = build_worktree_report(
+            wt_path, orch_usage, sub_usage_list, html_report_path=html_path_display
+        )
         report = report + "\n" + wt_report
         dbg(f"worktree report appended, total length={len(report)}")
 
