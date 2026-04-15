@@ -16,11 +16,15 @@ from pathlib import Path
 
 
 def bump_version(current: str, part: str) -> str:
-    """Bump a semver string by the specified part."""
+    """Bump a semver string by the specified part.
+
+    Raises ValueError when *current* is not a valid x.y.z semver string.
+    Raising (instead of sys.exit) keeps the function testable — callers
+    decide how to surface the error.
+    """
     parts = current.split(".")
     if len(parts) != 3 or not all(p.isdigit() for p in parts):
-        print(f"ERROR: '{current}' is not valid semver (x.y.z)", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError(f"Invalid semver: {current}")
     major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
     if part == "major":
         return f"{major + 1}.0.0"
@@ -48,29 +52,45 @@ def main():
         print(f"ERROR: {plugin_json} not found", file=sys.stderr)
         sys.exit(1)
 
-    # Read current version
-    manifest = json.loads(plugin_json.read_text(encoding="utf-8"))
-    current = manifest.get("version", "0.0.0")
+    # Read current version. Catch malformed JSON so users get a clean
+    # error message instead of a raw JSONDecodeError traceback.
+    try:
+        manifest = json.loads(plugin_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: {plugin_json} is not valid JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+    # Coerce to str — manifest.get could return a non-string if the file
+    # was hand-edited to e.g. a number; bump_version requires a string.
+    current = str(manifest.get("version", "0.0.0"))
 
-    # Compute new version
-    if args.set:
-        if not re.match(r"^\d+\.\d+\.\d+$", args.set):
-            print(f"ERROR: '{args.set}' is not valid semver (x.y.z)", file=sys.stderr)
-            sys.exit(1)
-        new_version = args.set
-    elif args.major:
-        new_version = bump_version(current, "major")
-    elif args.minor:
-        new_version = bump_version(current, "minor")
-    else:
-        new_version = bump_version(current, "patch")
+    # Compute new version. bump_version raises ValueError on invalid
+    # semver — we catch it here and translate to a clean exit(1).
+    try:
+        if args.set:
+            if not re.match(r"^\d+\.\d+\.\d+$", args.set):
+                print(
+                    f"ERROR: '{args.set}' is not valid semver (x.y.z)", file=sys.stderr
+                )
+                sys.exit(1)
+            new_version = args.set
+        elif args.major:
+            new_version = bump_version(current, "major")
+        elif args.minor:
+            new_version = bump_version(current, "minor")
+        else:
+            new_version = bump_version(current, "patch")
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if new_version == current:
         print(f"Version unchanged: {current}")
         return
 
-    # Update plugin.json
+    # Update plugin.json. Ensure the parent dir exists so first-time
+    # writes on a clean checkout don't crash with FileNotFoundError.
     manifest["version"] = new_version
+    plugin_json.parent.mkdir(parents=True, exist_ok=True)
     plugin_json.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",

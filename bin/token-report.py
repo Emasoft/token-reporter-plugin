@@ -28,6 +28,7 @@ Exit codes:
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -76,29 +77,34 @@ def main() -> int:
         )
         return 1
 
+    # Forward all user args. Only prepend --on-demand if the user didn't
+    # already pass it — otherwise the flag would appear twice.
+    user_args = list(sys.argv[1:])
+    if "--on-demand" not in user_args:
+        user_args = ["--on-demand", *user_args]
+
     cmd = [
         "uv",
         "run",
         "--with",
         "tiktoken",
-        "python3",
+        sys.executable,
         str(script),
-        "--on-demand",
-        *sys.argv[1:],
+        *user_args,
     ]
 
-    # os.execvp replaces the current process with uv — the exit code of
-    # the child becomes our exit code without an intermediate shell.
+    # subprocess.run is cross-platform (os.execvp is POSIX-only and would
+    # raise AttributeError on Windows). We forward the child's return code
+    # as our own exit code so shell callers see the real result.
     try:
-        os.execvp(cmd[0], cmd)
-    except FileNotFoundError:
+        result = subprocess.run(cmd)
+    except OSError:
         print(
             "[token-report] `uv` is not on PATH. Install from https://astral.sh/uv",
             file=sys.stderr,
         )
         return 1
-    # execvp either replaces process or raises — loop unreachable
-    return 1  # pragma: no cover
+    return result.returncode
 
 
 if __name__ == "__main__":
