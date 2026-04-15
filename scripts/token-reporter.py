@@ -1116,9 +1116,15 @@ def parse_agent_transcript(
                             text = result_content
                         else:
                             text = str(result_content)
-                        r["tools_tokens"][tool_name]["result_tokens"] += count_tokens(
-                            text
-                        )
+                        rt_fb = count_tokens(text)
+                        r["tools_tokens"][tool_name]["result_tokens"] += rt_fb
+                        # Mirror the skill crediting done in the inline
+                        # tool_result path above, so Skill invocations that
+                        # surface via the v2.1.85 fallback path still credit
+                        # their result bytes to the specific skill.
+                        skill_name_fb = skill_use_id_map.get(tuid, "")
+                        if skill_name_fb:
+                            r["skills_tokens"][skill_name_fb]["result_tokens"] += rt_fb
             continue
 
         # ── Process assistant entries ──
@@ -1307,21 +1313,22 @@ def parse_agent_transcript(
             # Skill's share of the assistant output (the bytes the model spent
             # writing the Skill tool-use block itself, NOT the skill's loaded
             # content — that is credited via tool_result below).
-            skill_blocks = [
-                b
-                for b in content
-                if isinstance(b, dict)
-                and b.get("type") == "tool_use"
-                and b.get("name") == "Skill"
-            ]
-            if skill_blocks:
-                per_skill_out = u.get("output_tokens", 0) // len(msg_tools)
-                for sb in skill_blocks:
-                    si = (
-                        sb.get("input", {}) if isinstance(sb.get("input"), dict) else {}
-                    )
-                    sname = si.get("skill", "") or "unknown"
-                    r["skills_tokens"][sname]["output_tokens"] += per_skill_out
+            # Must match the detection-path input validation exactly: a Skill
+            # block with a non-dict input was already skipped for invocation
+            # counting, so we skip it here too. Otherwise output_tokens could
+            # be attributed to a skill that has no invocation_count.
+            for sb in content:
+                if not (
+                    isinstance(sb, dict)
+                    and sb.get("type") == "tool_use"
+                    and sb.get("name") == "Skill"
+                ):
+                    continue
+                si = sb.get("input", {})
+                if not isinstance(si, dict):
+                    continue
+                sname = si.get("skill", "") or "unknown"
+                r["skills_tokens"][sname]["output_tokens"] += per_tool_out
 
     r["files_read"] = sorted(r["files_read"])
     r["files_written"] = sorted(r["files_written"])
@@ -1337,13 +1344,22 @@ def parse_agent_transcript(
             total_spill += size
             # Try exact match first, then longest-prefix match
             tool_name = tool_use_id_map.get(key, "")
+            matched_key = key if tool_name else ""
             if not tool_name:
                 for tuid, tn in tool_use_id_map.items():
                     if key.startswith(tuid) or tuid.startswith(key):
                         tool_name = tn
+                        matched_key = tuid
                         break
             if tool_name:
-                r["tools_tokens"][tool_name]["result_tokens"] += size // 4
+                sp_tok = size // 4
+                r["tools_tokens"][tool_name]["result_tokens"] += sp_tok
+                # If the spilled payload came from a Skill invocation, also
+                # credit it to the specific skill (same contract as the inline
+                # and toolUseResult paths above).
+                sk_sp = skill_use_id_map.get(matched_key, "")
+                if sk_sp:
+                    r["skills_tokens"][sk_sp]["result_tokens"] += sp_tok
         r["spilled_tool_bytes"] = total_spill
 
     return r
