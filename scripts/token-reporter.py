@@ -3093,6 +3093,35 @@ def _truncate_box_to_chars(box: str, target_chars: int) -> str:
     return minimal[: max(target_chars - 20, 100)] + "\n[...truncated]"
 
 
+def _extract_box_title(box: str) -> str:
+    """Return the first non-border content row from a pre-built unicode box.
+
+    Used by the smart-cap algorithm in main() when an overflow box is
+    converted to a "title-only" stub (state 3 of three: whole / truncated /
+    title-only). The title row is what the user sees as "Subagent Explore
+    abc123 | haiku-4-5 | 3 messages | 12s" — enough context to identify
+    the box without rendering its body.
+
+    Returns "(unknown box)" if no content row can be parsed.
+    """
+    ansi_re = re.compile(r"\033\[[0-9;]*m")
+    for line in box.splitlines():
+        plain = ansi_re.sub("", line)
+        stripped = plain.strip()
+        if not stripped:
+            continue
+        # Skip top borders (any flavour of corner / horizontal line).
+        first = stripped[0]
+        if first in "╭┌╔╮┐╗─━═┄┅┈┉┌┍┎┏┐┑┒┓":
+            continue
+        # Title row: starts with a vertical border and contains content.
+        if first in "│┃║" and len(stripped) > 4:
+            inner = stripped.strip("│┃║").strip()
+            if inner:
+                return inner
+    return "(unknown box)"
+
+
 def _render_box(rows: list[str | tuple[str, str]]) -> str:
     """Render rows into a unicode-bordered box with word-wrap."""
     import unicodedata
@@ -3654,38 +3683,82 @@ def main():
             f"applying smart per-box truncation"
         )
 
-        # Step 1: distribute the budget fairly. Sort boxes by size ascending
-        # and give each box either its full size (if it fits in its share)
-        # or its share of the remaining budget. Small boxes get a free pass;
-        # the truncation pressure concentrates on the large boxes.
-        # Reserve ~200 chars for newlines and a global safety margin.
+        # ── Smart capping algorithm (deterministic, three-state) ──
+        #
+        #   TOTCHARS         = MAX_HOOK_OUTPUT (hook output cap, default 10000)
+        #   TRUNCATIONLIMIT  = 1000  — boxes ≤ this are SMALL and never truncated
+        #   MAXBOXES         = 10    — at most this many full+truncated boxes
+        #   SAFETY_MARGIN    = 200   — reserve for newlines + global slack
+        #
+        # Step 1: if there are more than MAXBOXES boxes, the OLDEST overflow
+        #         boxes are converted to a one-line "title-only" stub
+        #         (state 3 of three: WHOLE / TRUNCATED / TITLE-ONLY). The
+        #         most recent boxes + the main report always survive.
+        # Step 2: classify the kept boxes into SMALL (≤ TRUNCATIONLIMIT,
+        #         printed whole) and BIG (> TRUNCATIONLIMIT, may be
+        #         truncated).
+        # Step 3: SMALLBOXESCHARS = sum of small box sizes. These are
+        #         exempt and consume their natural budget.
+        # Step 4: CHARSLEFT = TOTCHARS - SAFETY_MARGIN - SMALLBOXESCHARS
+        #                     - title_stubs_chars
+        # Step 5: MAXBIGBOXCHARS = CHARSLEFT // num_big_boxes
+        # Step 6: each big box is truncated to MAXBIGBOXCHARS — for the
+        #         "main" live box we re-render at smaller MAX_ENTRIES;
+        #         for pre-built subagent boxes we drop body rows via
+        #         _truncate_box_to_chars.
+        TOTCHARS = MAX_HOOK_OUTPUT
+        TRUNCATIONLIMIT = 1000
+        MAXBOXES = 10
         SAFETY_MARGIN = 200
-        usable = max(MAX_HOOK_OUTPUT - SAFETY_MARGIN, 1000)
 
-        # Compute per-box targets via the fair-share algorithm.
-        n_boxes = len(box_entries)
-        sized = sorted(enumerate(box_entries), key=lambda kv: len(kv[1][1]))
-        targets: dict[int, int] = {}
-        remaining_budget = usable
-        remaining_count = n_boxes
-        for orig_i, (tag, b) in sized:
-            fair = remaining_budget // remaining_count if remaining_count else 0
-            if len(b) <= fair:
-                # Small box: takes its full natural size, no truncation
-                targets[orig_i] = len(b)
-                remaining_budget -= len(b)
-            else:
-                # Large box: gets exactly its fair share of the remainder
-                targets[orig_i] = fair
-                remaining_budget -= fair
-            remaining_count -= 1
+        # Step 1: split into kept + overflow. The main report is always
+        # last in box_entries; we keep the most-recent N-1 subagent reports
+        # plus main, dropping the OLDEST subagents to title-only stubs.
+        if len(box_entries) > MAXBOXES:
+            kept_entries = box_entries[-MAXBOXES:]
+            overflow_entries = box_entries[:-MAXBOXES]
+        else:
+            kept_entries = box_entries
+            overflow_entries = []
 
-        # Step 2: apply truncation. For "main" box (which is the only live
-        # box still resident in this main() scope as a single string, with
-        # skills/worktree already concatenated inside it) we re-render it
-        # at progressively smaller MAX_ENTRIES until it fits its target.
-        # For "subagent" boxes we use _truncate_box_to_chars which drops
-        # body rows from a pre-built unicode box.
+        # Render overflow as compact one-line title stubs.
+        title_stubs: list[str] = []
+        for tag, b in overflow_entries:
+            title = _extract_box_title(b)
+            link_part = f" — see {html_path_display}" if html_path_display else ""
+            title_stubs.append(f"[{title}{link_part}]")
+        overflow_chars = sum(len(s) + 1 for s in title_stubs)
+
+        # Step 2-3: classify kept boxes.
+        small_indices = [
+            i for i, (_, b) in enumerate(kept_entries) if len(b) <= TRUNCATIONLIMIT
+        ]
+        big_indices = [
+            i for i, (_, b) in enumerate(kept_entries) if len(b) > TRUNCATIONLIMIT
+        ]
+        SMALLBOXESCHARS = sum(len(kept_entries[i][1]) + 1 for i in small_indices)
+
+        # Step 4-5: compute the per-big-box budget.
+        CHARSLEFT = TOTCHARS - SAFETY_MARGIN - SMALLBOXESCHARS - overflow_chars
+        if big_indices:
+            # Floor the per-box budget at TRUNCATIONLIMIT // 2 so we never
+            # squeeze a big box below something readable. If the math gives
+            # less than this floor, _truncate_box_to_chars will still
+            # preserve at least the header + footer + indicator.
+            MAXBIGBOXCHARS = max(CHARSLEFT // len(big_indices), TRUNCATIONLIMIT // 2)
+        else:
+            MAXBIGBOXCHARS = 0
+
+        dbg(
+            f"smart-cap: total={len(combined)} kept={len(kept_entries)} "
+            f"overflow={len(overflow_entries)} small={len(small_indices)} "
+            f"big={len(big_indices)} small_chars={SMALLBOXESCHARS} "
+            f"chars_left={CHARSLEFT} max_big={MAXBIGBOXCHARS}"
+        )
+
+        # Step 6: helper that re-renders the live "main" block at smaller
+        # MAX_ENTRIES until it fits its target. Falls back to row truncation
+        # if even MAX_ENTRIES=0 is too big.
         def _rebuild_main_under(target: int) -> str:
             rebuilt = ""
             for me_attempt in (max_entries, 8, 6, 4, 3, 2, 1, 0):
@@ -3728,23 +3801,30 @@ def main():
             # Even MAX_ENTRIES=0 doesn't fit — fall back to row truncation
             return _truncate_box_to_chars(rebuilt, target)
 
-        truncated_boxes: list[str] = []
-        for i, (tag, b) in enumerate(box_entries):
-            target = targets[i]
-            if len(b) <= target:
-                truncated_boxes.append(b)
-                continue
-            if tag == "main":
-                truncated_boxes.append(_rebuild_main_under(target))
+        # Step 6 (continued): apply the per-box decisions.
+        rendered_kept: list[str] = []
+        for i, (tag, b) in enumerate(kept_entries):
+            if i in small_indices:
+                # WHOLE state — printed unchanged
+                rendered_kept.append(b)
             else:
-                truncated_boxes.append(_truncate_box_to_chars(b, target))
+                # TRUNCATED state — fit into MAXBIGBOXCHARS
+                if tag == "main":
+                    rendered_kept.append(_rebuild_main_under(MAXBIGBOXCHARS))
+                else:
+                    rendered_kept.append(_truncate_box_to_chars(b, MAXBIGBOXCHARS))
 
-        combined = "\n".join(truncated_boxes)
-        # Final safety net: if the smart algorithm still left us over budget
-        # (shouldn't happen, but defense in depth), hard-truncate the tail.
-        if len(combined) > MAX_HOOK_OUTPUT:
-            combined = combined[: MAX_HOOK_OUTPUT - 20] + "\n[...truncated]"
-        dbg(f"smart-cap result: {len(combined)} chars ({len(truncated_boxes)} boxes)")
+        # Title-only stubs go FIRST so the main + recent boxes sit at the
+        # bottom (which the reader sees last and is most important).
+        combined = "\n".join(title_stubs + rendered_kept)
+
+        # Final safety net.
+        if len(combined) > TOTCHARS:
+            combined = combined[: TOTCHARS - 20] + "\n[...truncated]"
+        dbg(
+            f"smart-cap result: {len(combined)} chars ({len(rendered_kept)} "
+            f"boxes + {len(title_stubs)} stubs)"
+        )
 
     # Stop event successfully reported — clear the session event log so
     # the next session starts fresh.
