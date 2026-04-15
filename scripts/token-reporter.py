@@ -3031,6 +3031,68 @@ def build_worktree_report(
     return _render_box(rows)
 
 
+def _truncate_box_to_chars(box: str, target_chars: int) -> str:
+    """Drop body rows from a pre-built unicode box until it fits target_chars.
+
+    Used by main()'s output capping to enforce the per-box budget without
+    losing the box entirely. The box border integrity is preserved: top
+    border + header row(s) + separator stay intact, body rows are dropped
+    from the bottom one at a time, a single "[N rows truncated — see HTML
+    report]" indicator row is inserted, and the bottom border stays put.
+
+    Returns the original string when it already fits (no-op for small boxes).
+
+    Note: for LIVE boxes (build_report / build_skills_box / build_worktree_report)
+    main() prefers to rebuild with a smaller MAX_ENTRIES instead, because
+    that produces nicer per-section "+N more" indicators. This helper is
+    the fallback for PRE-BUILT subagent reports that were serialized to
+    /tmp by an earlier hook call and can no longer be re-rendered.
+    """
+    if len(box) <= target_chars:
+        return box
+    lines = box.splitlines()
+    if len(lines) <= 4:
+        return box  # too short to truncate meaningfully
+
+    # Identify the structural boundary: the separator row that comes right
+    # after the header (a horizontal divider built from box-drawing chars).
+    # If we can't find one, fall back to keeping the first 2 lines as header.
+    header_end = 2
+    for i in range(1, min(len(lines), 8)):
+        plain = re.sub(r"\033\[[0-9;]*m", "", lines[i])
+        if "├" in plain or "┝" in plain or "┠" in plain or "┣" in plain:
+            header_end = i + 1
+            break
+
+    header = lines[:header_end]
+    footer = lines[-1:]
+    body = lines[header_end:-1]
+
+    # Drop body rows from the bottom until the box fits, leaving room for
+    # the truncation indicator row (~80 chars).
+    indicator_template = (
+        "│ " + "\033[94m" + " ⋯ {n} rows truncated — see HTML report" + "\033[0m" + " │"
+    )
+    # Add the indicator after dropping rows
+    dropped = 0
+    while body:
+        candidate_body = body + [indicator_template.format(n=dropped + 1)]
+        candidate = "\n".join(header + candidate_body + footer)
+        if len(candidate) <= target_chars:
+            return candidate
+        body.pop()
+        dropped += 1
+
+    # Even an empty body + indicator + header + footer is too big.
+    # Last resort: just keep header + footer + indicator.
+    indicator = indicator_template.format(n=dropped) if dropped else ""
+    minimal = "\n".join(header + ([indicator] if indicator else []) + footer)
+    if len(minimal) <= target_chars:
+        return minimal
+    # Hard char-level truncation as the absolute fallback.
+    return minimal[: max(target_chars - 20, 100)] + "\n[...truncated]"
+
+
 def _render_box(rows: list[str | tuple[str, str]]) -> str:
     """Render rows into a unicode-bordered box with word-wrap."""
     import unicodedata
@@ -3533,10 +3595,6 @@ def main():
             pass
     dbg(f"collected {len(subagent_reports)} subagent reports")
 
-    # Combine: subagent reports first, then main session report
-    all_reports = subagent_reports + [report]
-    combined = "\n".join(all_reports)
-
     # Hook output character cap = 10,000 characters. This is hardcoded in the
     # Claude Code binary and is NOT user-configurable on the Claude side. The
     # authoritative source is https://code.claude.com/docs/en/hooks under the
@@ -3549,8 +3607,10 @@ def main():
     #
     # If we exceed 10K, our pretty unicode box gets replaced by an opaque
     # "[saved to file]" stub — bad UX. So we apply the same cap *ourselves*
-    # before that happens, drop oldest sub-agent reports, and direct the
-    # reader to the full HTML archive at <project>/reports/token-reporter/.
+    # before that happens, distribute the budget evenly across all boxes
+    # (small boxes get their full size, large boxes share the remainder),
+    # and direct the reader to the full HTML archive at
+    # <project>/reports/token-reporter/.
     #
     # The OUTPUT_LIMIT_CHARS user config exists as an escape hatch in case
     # Anthropic raises the cap in a future Claude Code version; for now,
@@ -3570,19 +3630,121 @@ def main():
         return 10_000
 
     MAX_HOOK_OUTPUT = _resolve_output_limit()
+
+    # All boxes that need to fit in the budget, in display order. The list
+    # is structured so we can rebuild "live" boxes (main / skills / worktree)
+    # at smaller MAX_ENTRIES and just truncate "pre-built" boxes (subagent
+    # reports from /tmp) row-by-row.
+    #   tag values: "subagent" | "main" | "skills" | "worktree"
+    box_entries: list[tuple[str, str]] = []
+    for sr in subagent_reports:
+        box_entries.append(("subagent", sr))
+    box_entries.append(("main", report))
+    # Note: skills_box and worktree boxes are already inside `report` via
+    # main()'s earlier append. They are not separate entries here. The
+    # per-box budget therefore applies to the combined main+skills+worktree
+    # block as one unit, which is fine because they are all live and were
+    # all rebuilt with the same MAX_ENTRIES at construction time.
+
+    combined = "\n".join(b for _, b in box_entries)
+
     if len(combined) > MAX_HOOK_OUTPUT:
         dbg(
             f"WARNING: output {len(combined)} chars exceeds {MAX_HOOK_OUTPUT}, "
-            f"truncating to fit hook output limit"
+            f"applying smart per-box truncation"
         )
-        # Keep the main session report (last entry), drop oldest subagent reports
-        while len(combined) > MAX_HOOK_OUTPUT and len(all_reports) > 1:
-            dropped = all_reports.pop(0)
-            dbg(f"  dropped subagent report ({len(dropped)} chars)")
-            combined = "\n".join(all_reports)
-        # If still too large, hard-truncate
+
+        # Step 1: distribute the budget fairly. Sort boxes by size ascending
+        # and give each box either its full size (if it fits in its share)
+        # or its share of the remaining budget. Small boxes get a free pass;
+        # the truncation pressure concentrates on the large boxes.
+        # Reserve ~200 chars for newlines and a global safety margin.
+        SAFETY_MARGIN = 200
+        usable = max(MAX_HOOK_OUTPUT - SAFETY_MARGIN, 1000)
+
+        # Compute per-box targets via the fair-share algorithm.
+        n_boxes = len(box_entries)
+        sized = sorted(enumerate(box_entries), key=lambda kv: len(kv[1][1]))
+        targets: dict[int, int] = {}
+        remaining_budget = usable
+        remaining_count = n_boxes
+        for orig_i, (tag, b) in sized:
+            fair = remaining_budget // remaining_count if remaining_count else 0
+            if len(b) <= fair:
+                # Small box: takes its full natural size, no truncation
+                targets[orig_i] = len(b)
+                remaining_budget -= len(b)
+            else:
+                # Large box: gets exactly its fair share of the remainder
+                targets[orig_i] = fair
+                remaining_budget -= fair
+            remaining_count -= 1
+
+        # Step 2: apply truncation. For "main" box (which is the only live
+        # box still resident in this main() scope as a single string, with
+        # skills/worktree already concatenated inside it) we re-render it
+        # at progressively smaller MAX_ENTRIES until it fits its target.
+        # For "subagent" boxes we use _truncate_box_to_chars which drops
+        # body rows from a pre-built unicode box.
+        def _rebuild_main_under(target: int) -> str:
+            rebuilt = ""
+            for me_attempt in (max_entries, 8, 6, 4, 3, 2, 1, 0):
+                if me_attempt > max_entries:
+                    continue
+                rebuilt = build_report(
+                    hook_event,
+                    hook_input,
+                    usage,
+                    identity,
+                    sub_usage_list,
+                    session_events=session_events,
+                    subagent_fallback=subagent_fallback,
+                    events_log_path=str(events_log_path) if events_log_path else "",
+                    skills_box=skills_box_enabled,
+                    max_entries=me_attempt,
+                    html_report_path=html_path_display,
+                )
+                if skills_box_enabled:
+                    sk_extra = build_skills_box(
+                        usage,
+                        max_entries=me_attempt,
+                        html_report_path=html_path_display,
+                    )
+                    if sk_extra:
+                        rebuilt = rebuilt + "\n" + sk_extra
+                if sub_usage_list:
+                    orch_usage_inner = parse_agent_transcript(
+                        active_transcript, session_id=""
+                    )
+                    wt_extra = build_worktree_report(
+                        hook_input.get("cwd", active_transcript),
+                        orch_usage_inner,
+                        sub_usage_list,
+                        html_report_path=html_path_display,
+                    )
+                    rebuilt = rebuilt + "\n" + wt_extra
+                if len(rebuilt) <= target:
+                    return rebuilt
+            # Even MAX_ENTRIES=0 doesn't fit — fall back to row truncation
+            return _truncate_box_to_chars(rebuilt, target)
+
+        truncated_boxes: list[str] = []
+        for i, (tag, b) in enumerate(box_entries):
+            target = targets[i]
+            if len(b) <= target:
+                truncated_boxes.append(b)
+                continue
+            if tag == "main":
+                truncated_boxes.append(_rebuild_main_under(target))
+            else:
+                truncated_boxes.append(_truncate_box_to_chars(b, target))
+
+        combined = "\n".join(truncated_boxes)
+        # Final safety net: if the smart algorithm still left us over budget
+        # (shouldn't happen, but defense in depth), hard-truncate the tail.
         if len(combined) > MAX_HOOK_OUTPUT:
-            combined = combined[:MAX_HOOK_OUTPUT] + "\n[...truncated]"
+            combined = combined[: MAX_HOOK_OUTPUT - 20] + "\n[...truncated]"
+        dbg(f"smart-cap result: {len(combined)} chars ({len(truncated_boxes)} boxes)")
 
     # Stop event successfully reported — clear the session event log so
     # the next session starts fresh.
