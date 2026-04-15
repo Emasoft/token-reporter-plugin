@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.0] - 2026-04-15
+
+
+### Documentation
+
+- Clarify hook output cap is firm 10,000 chars
+
+
+### Features
+
+- Smart fair-share box truncation under 10K hook output cap
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.9.1
+
 ## [1.9.1] - 2026-04-15
 
 
