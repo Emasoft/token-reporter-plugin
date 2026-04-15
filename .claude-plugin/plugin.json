@@ -1,7 +1,7 @@
 {
   "name": "token-reporter",
   "version": "1.7.2",
-  "description": "Per-operation token usage reporter for Claude Code 2.1.101+. Shows token counts, cost estimates, tool attribution, cache invalidation detection, worktree sub-agent breakdown, compact_boundary markers, CLAUDE.md reload events, and file activity when agents complete. Only outputs in debug mode (claude --debug).",
+  "description": "Per-operation token usage reporter for Claude Code 2.1.108+. Shows token counts, cost estimates, tool + skill + agent attribution, cache invalidation detection, worktree sub-agent breakdown, compact_boundary markers, CLAUDE.md reload events, and file activity when agents complete. Only outputs in debug mode (claude --debug).",
   "author": {
     "name": "Emasoft",
     "email": "713559+Emasoft@users.noreply.github.com"
@@ -20,7 +20,9 @@
     "attribution",
     "monitoring",
     "compaction",
-    "instructions-loaded"
+    "instructions-loaded",
+    "skills",
+    "agents"
   ],
   "userConfig": {
     "OUTPUT_LIMIT_CHARS": {

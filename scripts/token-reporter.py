@@ -582,6 +582,24 @@ def _merge_usage(base: dict, add: dict):
             base_tt[tool] = {"input": 0, "output": 0, "result_tokens": 0}
         for f in ["input", "output", "result_tokens"]:
             base_tt[tool][f] += tok.get(f, 0)
+    # Merge skills (v2.1.108+ built-in commands route through Skill tool)
+    for skill, count in add.get("skills_used", {}).items():
+        base.setdefault("skills_used", Counter())[skill] += count
+    base_sk = base.setdefault(
+        "skills_tokens",
+        defaultdict(
+            lambda: {"invocation_count": 0, "result_tokens": 0, "output_tokens": 0}
+        ),
+    )
+    for skill, tok in add.get("skills_tokens", {}).items():
+        if skill not in base_sk:
+            base_sk[skill] = {
+                "invocation_count": 0,
+                "result_tokens": 0,
+                "output_tokens": 0,
+            }
+        for f in ["invocation_count", "result_tokens", "output_tokens"]:
+            base_sk[skill][f] += tok.get(f, 0)
     # Merge file sets
     for f in ["files_read", "files_written", "files_edited"]:
         existing = base.get(f, [])
@@ -892,6 +910,18 @@ def parse_agent_transcript(
     tools_tokens: defaultdict[str, dict[str, int]] = defaultdict(
         lambda: {"input": 0, "output": 0, "result_tokens": 0}
     )
+    # v2.1.108: built-in slash commands are now routed through the Skill tool.
+    # Every `tool_use` block with name=="Skill" has `input.skill` = the skill
+    # identifier (e.g. "commit", "code-auditor-agent:caa-pr-review-skill",
+    # or a built-in like "init"/"review"/"security-review"). We track these
+    # separately so the report can show which skills cost what.
+    skills_tokens: defaultdict[str, dict[str, int]] = defaultdict(
+        lambda: {
+            "invocation_count": 0,
+            "result_tokens": 0,  # bytes of skill content loaded into context
+            "output_tokens": 0,  # bytes the model spent issuing the Skill call
+        }
+    )
     r: dict[str, Any] = {
         "input_tokens": 0,
         "output_tokens": 0,
@@ -901,6 +931,8 @@ def parse_agent_transcript(
         "models_used": models_used,
         "tools_used": Counter(),
         "tools_tokens": tools_tokens,
+        "skills_used": Counter(),  # skill_name -> invocation count
+        "skills_tokens": skills_tokens,  # skill_name -> per-skill totals
         "files_read": set(),
         "files_written": set(),
         "files_edited": set(),
@@ -962,6 +994,11 @@ def parse_agent_transcript(
 
     # Map tool_use_id -> tool_name so we can attribute tool_result costs
     tool_use_id_map = {}  # type: dict[str, str]
+    # Map tool_use_id -> skill_name for Skill tool invocations. This lets us
+    # credit a Skill call's tool_result (the skill content loaded into
+    # context) to the specific skill name rather than to the generic "Skill"
+    # tool bucket.
+    skill_use_id_map = {}  # type: dict[str, str]
 
     # v2.1.90: large tool outputs are spilled to
     #   {transcript_parent}/{session_id}/tool-results/*.json
@@ -1050,7 +1087,15 @@ def parse_agent_transcript(
                         text = result_content
                     else:
                         text = str(result_content)
-                    r["tools_tokens"][tool_name]["result_tokens"] += count_tokens(text)
+                    rt = count_tokens(text)
+                    r["tools_tokens"][tool_name]["result_tokens"] += rt
+                    # If this tool_result came from a Skill invocation, also
+                    # credit the result_tokens (the skill content bytes loaded
+                    # into context) to the specific skill so per-skill reports
+                    # show the actual cost of loading each skill.
+                    skill_name = skill_use_id_map.get(tuid, "")
+                    if skill_name:
+                        r["skills_tokens"][skill_name]["result_tokens"] += rt
 
             # v2.1.85+: toolUseResult at entry level carries tool result data.
             # Use sourceToolAssistantUUID to trace back to the assistant turn,
@@ -1219,6 +1264,16 @@ def parse_agent_transcript(
             ti = block.get("input", {})
             if not isinstance(ti, dict):
                 continue
+            # v2.1.108: built-in slash commands routed through Skill tool.
+            # Every Skill tool_use carries input.skill = the skill identifier
+            # (e.g. "commit", "code-auditor-agent:caa-pr-review-skill"). Track
+            # these separately so the report shows which skills cost what.
+            if tn == "Skill":
+                skill_name = ti.get("skill", "") or "unknown"
+                r["skills_used"][skill_name] += 1
+                r["skills_tokens"][skill_name]["invocation_count"] += 1
+                if tuid:
+                    skill_use_id_map[tuid] = skill_name
             fp = ti.get("file_path", "")
             if tn == "Read" and fp:
                 r["files_read"].add(fp)
@@ -1247,6 +1302,26 @@ def parse_agent_transcript(
             for tn in msg_tools:
                 r["tools_tokens"][tn]["output"] += per_tool_out
                 r["tools_tokens"][tn]["input"] += per_tool_inp
+            # Also attribute output bytes to each skill the message spawned.
+            # A single message can issue multiple Skill invocations; credit each
+            # Skill's share of the assistant output (the bytes the model spent
+            # writing the Skill tool-use block itself, NOT the skill's loaded
+            # content — that is credited via tool_result below).
+            skill_blocks = [
+                b
+                for b in content
+                if isinstance(b, dict)
+                and b.get("type") == "tool_use"
+                and b.get("name") == "Skill"
+            ]
+            if skill_blocks:
+                per_skill_out = u.get("output_tokens", 0) // len(msg_tools)
+                for sb in skill_blocks:
+                    si = (
+                        sb.get("input", {}) if isinstance(sb.get("input"), dict) else {}
+                    )
+                    sname = si.get("skill", "") or "unknown"
+                    r["skills_tokens"][sname]["output_tokens"] += per_skill_out
 
     r["files_read"] = sorted(r["files_read"])
     r["files_written"] = sorted(r["files_written"])
@@ -1763,6 +1838,61 @@ def build_report(
             ("", f"{S}  L total result→input:{R} {Y}{fmt_tok(total_result_in)}{R}")
         )
 
+    # Skills (v2.1.108+: built-in slash commands are routed through Skill tool).
+    # Each skill invocation credits: invocation_count, result_tokens (the skill
+    # content loaded into context), and output_tokens (the model's share of
+    # output spent writing the Skill tool-use block). We cost result_tokens at
+    # the input rate and output_tokens at the output rate using the session's
+    # most-used model as the reference.
+    skills_used_ctr = usage.get("skills_used", Counter())
+    skills_tokens_d = usage.get("skills_tokens", {})
+    if skills_used_ctr:
+        ref_model = ""
+        ref_tok = -1
+        for m_name, m_stats in models_used.items():
+            if m_name == "<synthetic>":
+                continue
+            t = m_stats.get("input_tokens", 0) + m_stats.get("output_tokens", 0)
+            if t > ref_tok:
+                ref_tok = t
+                ref_model = m_name
+        sk_pricing = get_pricing(ref_model)
+        skill_rows: list[tuple[str, int, int, int, float]] = []
+        for sk_name, sk_count in skills_used_ctr.items():
+            st = skills_tokens_d.get(sk_name, {})
+            sk_res = st.get("result_tokens", 0)
+            sk_out = st.get("output_tokens", 0)
+            sk_cost = (sk_res / 1e6) * sk_pricing["input"] + (
+                sk_out / 1e6
+            ) * sk_pricing["output"]
+            skill_rows.append((sk_name, sk_count, sk_res, sk_out, sk_cost))
+        skill_rows.sort(key=lambda x: x[4], reverse=True)
+        total_sk_calls = sum(sk_count for _, sk_count, _, _, _ in skill_rows)
+        rows.append(
+            (
+                "Skills",
+                f"{W}{len(skill_rows)}{R} {S}skills{R} {S}/{R} "
+                f"{G}x{total_sk_calls}{R} {S}calls{R}",
+            )
+        )
+        for sk_name, sk_count, sk_res, sk_out, sk_cost in skill_rows:
+            short_sk = sk_name if len(sk_name) <= 34 else sk_name[:31] + "..."
+            parts = []
+            if sk_res > 0:
+                parts.append(f"{Y}{fmt_tok(sk_res)}{R} {S}result→input{R}")
+            if sk_out > 0:
+                parts.append(f"{Y}{fmt_tok(sk_out)}{R} {S}out{R}")
+            if sk_cost > 0:
+                parts.append(f"{C}${sk_cost:.3f}{R}")
+            detail = f" {S}/{R} ".join(parts) if parts else ""
+            detail_str = f"{S}:{R} {detail}" if detail else ""
+            rows.append(
+                (
+                    "",
+                    f"{S}  L{R} {W}{short_sk}{R} {G}x{sk_count}{R}{detail_str}",
+                )
+            )
+
     # Bash commands executed
     bash_cmds = usage.get("bash_commands", [])
     if bash_cmds:
@@ -1825,6 +1955,50 @@ def build_report(
                 f" {S}out{R}",
             )
         )
+
+        # Aggregate by agent_type so users can see which agent TYPE is the most
+        # expensive across all invocations, not just which individual instance.
+        # This is critical when the same agent type (e.g. "Explore") is spawned
+        # many times — the individual rows show small per-instance cost but the
+        # type-level aggregate reveals the total drain.
+        type_agg: dict[str, dict[str, float]] = {}
+        for sa_info, sa_usage in sub_usage_list:
+            sa_type = sa_info.get("agent_type", "") or "untyped"
+            if sa_type not in type_agg:
+                type_agg[sa_type] = {"count": 0.0, "inp": 0.0, "out": 0.0, "cost": 0.0}
+            type_agg[sa_type]["count"] += 1
+            type_agg[sa_type]["inp"] += (
+                sa_usage["input_tokens"] + sa_usage["cache_creation_input_tokens"]
+            )
+            type_agg[sa_type]["out"] += sa_usage["output_tokens"]
+            type_agg[sa_type]["cost"] += sum(
+                estimate_cost(s, m) for m, s in sa_usage.get("models_used", {}).items()
+            )
+        if len(type_agg) > 1 or (
+            len(type_agg) == 1 and next(iter(type_agg.values()))["count"] > 1
+        ):
+            type_rows = sorted(
+                type_agg.items(), key=lambda kv: kv[1]["cost"], reverse=True
+            )
+            rows.append(("", f"  {S}by type:{R}"))
+            for tname, ts in type_rows:
+                tcnt = int(ts["count"])
+                tinp = int(ts["inp"])
+                tout = int(ts["out"])
+                tcost = ts["cost"]
+                cost_str = f" {C}${tcost:.4f}{R}" if tcost > 0 else ""
+                rows.append(
+                    (
+                        "",
+                        f"    {S}*{R} {W}{trunc(tname, 28)}{R}"
+                        f" {G}x{tcnt}{R}"
+                        f" {Y}{fmt_tok(tinp)}{R}"
+                        f"{S}/{R}"
+                        f"{Y}{fmt_tok(tout)}{R}"
+                        f"{cost_str}",
+                    )
+                )
+
         for sa_info, sa_usage in sub_usage_list:
             sa_type = sa_info.get("agent_type", "")
             sa_desc = sa_info.get("description", "")
@@ -2154,6 +2328,56 @@ def build_worktree_report(
         if mcp:
             for t, c in mcp[:5]:
                 rows.append(("", f"  {S}L{R} {W}{shorten_mcp_tool(t)}{R} {G}x{c}{R}"))
+
+    # ── Skills across all worktree agents (v2.1.108+) ──
+    combined_skills: Counter[str] = Counter()
+    combined_skill_tokens: dict[str, dict[str, int]] = {}
+    for u in all_usages:
+        for sk, count in u.get("skills_used", {}).items():
+            combined_skills[sk] += count
+        for sk, tok in u.get("skills_tokens", {}).items():
+            if sk not in combined_skill_tokens:
+                combined_skill_tokens[sk] = {
+                    "invocation_count": 0,
+                    "result_tokens": 0,
+                    "output_tokens": 0,
+                }
+            for f in ("invocation_count", "result_tokens", "output_tokens"):
+                combined_skill_tokens[sk][f] += tok.get(f, 0)
+    if combined_skills:
+        ref_model_wt = ""
+        ref_tok_wt = -1
+        for u in all_usages:
+            for m_name, m_stats in u.get("models_used", {}).items():
+                if m_name == "<synthetic>":
+                    continue
+                t_wt = m_stats.get("input_tokens", 0) + m_stats.get("output_tokens", 0)
+                if t_wt > ref_tok_wt:
+                    ref_tok_wt = t_wt
+                    ref_model_wt = m_name
+        sk_p_wt = get_pricing(ref_model_wt)
+        sk_rows_wt: list[tuple[str, int, float]] = []
+        for sk_name, sk_count in combined_skills.items():
+            st = combined_skill_tokens.get(sk_name, {})
+            sk_res = st.get("result_tokens", 0)
+            sk_out = st.get("output_tokens", 0)
+            sk_cost = (sk_res / 1e6) * sk_p_wt["input"] + (sk_out / 1e6) * sk_p_wt[
+                "output"
+            ]
+            sk_rows_wt.append((sk_name, sk_count, sk_cost))
+        sk_rows_wt.sort(key=lambda x: x[2], reverse=True)
+        total_sk_calls_wt = sum(c for _, c, _ in sk_rows_wt)
+        rows.append(
+            (
+                "Skills",
+                f"{W}{len(sk_rows_wt)}{R} {S}skills{R} {S}/{R}"
+                f" {G}x{total_sk_calls_wt}{R} {S}calls{R}",
+            )
+        )
+        for sk_name, sk_count, sk_cost in sk_rows_wt[:6]:
+            short_sk = sk_name if len(sk_name) <= 34 else sk_name[:31] + "..."
+            cost_str = f" {C}${sk_cost:.4f}{R}" if sk_cost > 0 else ""
+            rows.append(("", f"  {S}L{R} {W}{short_sk}{R} {G}x{sk_count}{R}{cost_str}"))
 
     return _render_box(rows)
 

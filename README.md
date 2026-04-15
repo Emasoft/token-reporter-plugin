@@ -3,7 +3,7 @@
 <!--BADGES-START-->
 <!--BADGES-END-->
 
-A Claude Code plugin that displays per-operation token usage when agents and subagents complete. **Only outputs in debug mode** (`claude --debug`). Tracks **Claude Code 2.1.85–2.1.101**.
+A Claude Code plugin that displays per-operation token usage when agents and subagents complete. **Only outputs in debug mode** (`claude --debug`). Tracks **Claude Code 2.1.85–2.1.108**.
 
 ## What it reports
 
@@ -25,6 +25,8 @@ After each Claude Code response (in debug mode), a compact unicode-bordered repo
 - **Worktree sub-agent breakdown** — dedicated box showing per-agent cache dynamics when skills spawn agent swarms in worktrees
 - **Duration** — elapsed time from first to last message in the operation
 - **Per-tool attribution** — input, output, and result tokens for each tool used
+- **Per-skill attribution** — v2.1.108+ built-in slash commands route through the `Skill` tool. Each skill invocation shows invocation count, result→input bytes (the skill content loaded into context), output bytes, and an estimated cost per skill. Skills are sorted by cost so the biggest drains float to the top
+- **Sub-agent aggregation by type** — when the same agent type is spawned multiple times (e.g. `Explore x5`), an aggregated row shows the total count, tokens, and cost per type in addition to the individual per-instance drill-down
 - **Cost estimate** — based on published Anthropic API pricing, scoped to lifetime (agents) or current operation (session)
 - **Agent identity** — agent type/name (via v2.1.101 `agent_id`/`agent_type` hook input fields), model, message count, duration
 - **Bash commands** — every shell command executed, listed individually
