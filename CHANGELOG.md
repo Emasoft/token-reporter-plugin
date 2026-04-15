@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.9.0] - 2026-04-15
+
+
+### Features
+
+- Standalone Skills box, per-section truncation, HTML report
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.8.1
+
 ## [1.8.1] - 2026-04-15
 
 
