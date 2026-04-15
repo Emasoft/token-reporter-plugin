@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.1] - 2026-04-15
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.10.0
+
+
+### Refactoring
+
+- Simpler TRUNCATIONLIMIT/MAXBOXES smart-cap algorithm
+
 ## [1.10.0] - 2026-04-15
 
 
