@@ -2667,6 +2667,7 @@ def build_worktree_report(
     orchestrator_usage: dict,
     sub_usage_list: list,
     html_report_path: str = "",
+    max_entries: int = 0,
 ) -> str:
     """Build a detailed worktree breakdown box showing per-agent cache dynamics.
 
@@ -2681,6 +2682,9 @@ def build_worktree_report(
             "Full report:" footer line so the reader can open the complete
             HTML record. Caller is expected to pass a project-relative path
             (e.g. "./reports/token-reporter/...").
+        max_entries: Per-section cap for the sub-agent drill-down and any
+            sub-lists. 0 = unlimited. Matches build_report's convention so
+            the smart-cap rebuild path in main() can pass the same value.
     """
     # ANSI palette (same as build_report)
     S = "\033[94m"
@@ -2827,10 +2831,11 @@ def build_worktree_report(
         )
     )
 
-    # ── Per-agent breakdown ──
+    # ── Per-agent breakdown (capped by max_entries) ──
     if sub_usage_list:
         rows.append(("Agents", f"{W}{n_agents}{R} {S}spawned in worktree{R}"))
-        for sa_info, sa_usage in sub_usage_list:
+        shown_subs_wt, hidden_subs_wt = _cap_list(sub_usage_list, max_entries)
+        for sa_info, sa_usage in shown_subs_wt:
             sa_type = sa_info.get("agent_type", "")
             sa_desc = sa_info.get("description", "")
             sa_label = sa_type or sa_desc or sa_info["agent_id"][:12]
@@ -2878,6 +2883,9 @@ def build_worktree_report(
                 if sa_cr > 0:
                     parts.append(f"{C}{fmt_tok(sa_cr)}{R} {S}read{R}")
                 rows.append(("", f"    {S}L cache:{R} {f' {S}/{R} '.join(parts)}"))
+        if hidden_subs_wt:
+            more_hint = " — see HTML report" if html_report_path else ""
+            rows.append(("", f"{S}  ⋯ +{hidden_subs_wt} more sub-agents{more_hint}{R}"))
 
     # ── Cache invalidation events across all worktree agents ──
     all_cache_events = []
@@ -3031,6 +3039,34 @@ def build_worktree_report(
     return _render_box(rows)
 
 
+def _line_safe_truncate(s: str, target: int, suffix: str = "\n[...truncated]") -> str:
+    """Truncate s to at most target chars by cutting at the last newline.
+
+    Unicode boxes contain ANSI color sequences. A naive char-slice
+    (`s[:target]`) can cut a line mid-escape, leaving a stray ESC[ byte
+    that corrupts the reader's terminal state. By cutting at a newline
+    boundary we guarantee each retained line is a complete, self-contained
+    unit. Every row in our boxes ends with a reset so no color state leaks.
+
+    When the budget is so small that no full line fits, falls back to a
+    hard char slice at `max(target - len(suffix), 0)`. This is worse than
+    line-safe but only triggers on degenerate inputs.
+    """
+    if len(s) <= target:
+        return s
+    budget = target - len(suffix)
+    if budget <= 0:
+        # Not even room for the suffix — return just the suffix
+        return suffix.lstrip("\n")
+    cut = s.rfind("\n", 0, budget)
+    if cut <= 0:
+        # No newline before the budget — fall back to a hard cut at the
+        # last char. Worst case: a mid-ANSI corruption, but this only
+        # triggers on strings with no newlines at all.
+        return s[:budget] + suffix
+    return s[:cut] + suffix
+
+
 def _truncate_box_to_chars(box: str, target_chars: int) -> str:
     """Drop body rows from a pre-built unicode box until it fits target_chars.
 
@@ -3089,8 +3125,8 @@ def _truncate_box_to_chars(box: str, target_chars: int) -> str:
     minimal = "\n".join(header + ([indicator] if indicator else []) + footer)
     if len(minimal) <= target_chars:
         return minimal
-    # Hard char-level truncation as the absolute fallback.
-    return minimal[: max(target_chars - 20, 100)] + "\n[...truncated]"
+    # Line-safe fallback — preserves ANSI integrity by cutting at newlines.
+    return _line_safe_truncate(minimal, target_chars)
 
 
 def _extract_box_title(box: str) -> str:
@@ -3105,14 +3141,32 @@ def _extract_box_title(box: str) -> str:
     Returns "(unknown box)" if no content row can be parsed.
     """
     ansi_re = re.compile(r"\033\[[0-9;]*m")
+    # Box-drawing chars that can appear as the first char of a border or
+    # separator row. Covers single, double, and heavy variants for
+    # corners, horizontal lines, T-junctions and crosses. If the first
+    # char of a stripped line is in this set, the line is a border — we
+    # skip it and keep looking for the title row (which starts with a
+    # vertical border char like │ ┃ ║).
+    _BORDER_FIRST_CHARS = (
+        "╭╮╯╰"  # rounded corners
+        "┌┐└┘"  # light corners
+        "┏┓┛┗"  # heavy corners
+        "╔╗╚╝"  # double corners
+        "─━═"  # horizontal lines (light / heavy / double)
+        "┄┅┈┉"  # dashed
+        "┍┎┑┒┕┖┙┚"  # mixed light/heavy corners
+        "├┤┝┠┣┥┨┫"  # T-junctions
+        "┬┭┰┱┳"  # top T
+        "┴┵┸┹┻"  # bottom T
+        "┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋"  # crosses (all weights)
+    )
     for line in box.splitlines():
         plain = ansi_re.sub("", line)
         stripped = plain.strip()
         if not stripped:
             continue
-        # Skip top borders (any flavour of corner / horizontal line).
         first = stripped[0]
-        if first in "╭┌╔╮┐╗─━═┄┅┈┉┌┍┎┏┐┑┒┓":
+        if first in _BORDER_FIRST_CHARS:
             continue
         # Title row: starts with a vertical border and contains content.
         if first in "│┃║" and len(stripped) > 4:
@@ -3584,7 +3638,11 @@ def main():
         orch_usage = parse_agent_transcript(active_transcript, session_id="")
         wt_path = hook_input.get("cwd", active_transcript)
         wt_report = build_worktree_report(
-            wt_path, orch_usage, sub_usage_list, html_report_path=html_path_display
+            wt_path,
+            orch_usage,
+            sub_usage_list,
+            html_report_path=html_path_display,
+            max_entries=max_entries,
         )
         report = report + "\n" + wt_report
         dbg(f"worktree report appended, total length={len(report)}")
@@ -3608,10 +3666,21 @@ def main():
         print(json.dumps(output))
         sys.exit(0)
 
-    # Stop event: collect any saved subagent reports, prepend them, then show all
+    # Stop event: collect any saved subagent reports, prepend them, then show all.
+    # Sort by file modification time so the smart-cap algorithm's "drop
+    # oldest first" priority works reliably. Alphabetical sort is unreliable
+    # because filenames are `subagent-<aid>-<ts>.txt` — sorting by aid first
+    # would mix agents from different timestamps together.
     subagent_reports = []
     if report_dir.exists():
-        for f in sorted(report_dir.glob("subagent-*.txt")):
+
+        def _mtime(p: Path) -> float:
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        for f in sorted(report_dir.glob("subagent-*.txt"), key=_mtime):
             try:
                 subagent_reports.append(f.read_text(encoding="utf-8"))
                 f.unlink()  # clean up after reading
@@ -3711,23 +3780,56 @@ def main():
         MAXBOXES = 10
         SAFETY_MARGIN = 200
 
+        # Helper: accurate char count for a list of strings joined by "\n".
+        # "\n".join() produces N-1 newlines for N items, not N, so we must
+        # NOT use `sum(len(x) + 1)` which would overcount by 1 per item.
+        def _joined_len(items: list) -> int:
+            if not items:
+                return 0
+            return sum(len(x) for x in items) + (len(items) - 1)
+
+        # Helper: render an overflow box as a compact one-line title stub.
+        def _stub_for(box: str) -> str:
+            title = _extract_box_title(box)
+            link_part = f" — see {html_path_display}" if html_path_display else ""
+            return f"[{title}{link_part}]"
+
         # Step 1: split into kept + overflow. The main report is always
         # last in box_entries; we keep the most-recent N-1 subagent reports
         # plus main, dropping the OLDEST subagents to title-only stubs.
         if len(box_entries) > MAXBOXES:
-            kept_entries = box_entries[-MAXBOXES:]
-            overflow_entries = box_entries[:-MAXBOXES]
+            kept_entries = list(box_entries[-MAXBOXES:])
+            overflow_entries = list(box_entries[:-MAXBOXES])
         else:
-            kept_entries = box_entries
+            kept_entries = list(box_entries)
             overflow_entries = []
 
-        # Render overflow as compact one-line title stubs.
-        title_stubs: list[str] = []
-        for tag, b in overflow_entries:
-            title = _extract_box_title(b)
-            link_part = f" — see {html_path_display}" if html_path_display else ""
-            title_stubs.append(f"[{title}{link_part}]")
-        overflow_chars = sum(len(s) + 1 for s in title_stubs)
+        title_stubs: list[str] = [_stub_for(b) for _, b in overflow_entries]
+
+        # Step 1b: if even SMALLBOXESCHARS alone would exceed the budget
+        # (pathological case: e.g. 10 boxes each ≈ TRUNCATIONLIMIT), drop
+        # the OLDEST kept subagent to a title-only stub iteratively until
+        # the small boxes fit. The main report is never dropped (it's the
+        # last entry, so we only iterate while the first entry is a sub-
+        # agent). This is the user's spec: "to keep TRUNCATIONLIMIT big
+        # enough to get a reasonable box size, we can only limit the
+        # number of total boxes printed at each time".
+        while len(kept_entries) > 1:
+            small_probe = [b for _, b in kept_entries if len(b) <= TRUNCATIONLIMIT]
+            small_probe_chars = _joined_len(small_probe)
+            stubs_probe_chars = _joined_len(title_stubs)
+            # Reserve at least SAFETY_MARGIN + one small minimum for any
+            # big boxes. If the small boxes + stubs alone already eat past
+            # the budget, shed the oldest kept entry.
+            reserved = SAFETY_MARGIN + stubs_probe_chars
+            if small_probe_chars + reserved <= TOTCHARS:
+                break
+            if kept_entries[0][0] != "subagent":
+                # First entry is not a subagent (shouldn't happen: main is
+                # always last). Bail out to avoid an infinite loop.
+                break
+            _, dropped_box = kept_entries.pop(0)
+            title_stubs.append(_stub_for(dropped_box))
 
         # Step 2-3: classify kept boxes.
         small_indices = [
@@ -3736,22 +3838,24 @@ def main():
         big_indices = [
             i for i, (_, b) in enumerate(kept_entries) if len(b) > TRUNCATIONLIMIT
         ]
-        SMALLBOXESCHARS = sum(len(kept_entries[i][1]) + 1 for i in small_indices)
+        SMALLBOXESCHARS = _joined_len([kept_entries[i][1] for i in small_indices])
+        overflow_chars = _joined_len(title_stubs)
 
-        # Step 4-5: compute the per-big-box budget.
-        CHARSLEFT = TOTCHARS - SAFETY_MARGIN - SMALLBOXESCHARS - overflow_chars
+        # Step 4-5: compute the per-big-box budget. No hard floor — the
+        # math is exact and clamped to 0 so negative values don't leak
+        # into the arithmetic. _truncate_box_to_chars handles very small
+        # targets gracefully (it falls back to a line-safe truncation of
+        # the minimal header + footer).
+        CHARSLEFT = max(TOTCHARS - SAFETY_MARGIN - SMALLBOXESCHARS - overflow_chars, 0)
         if big_indices:
-            # Floor the per-box budget at TRUNCATIONLIMIT // 2 so we never
-            # squeeze a big box below something readable. If the math gives
-            # less than this floor, _truncate_box_to_chars will still
-            # preserve at least the header + footer + indicator.
-            MAXBIGBOXCHARS = max(CHARSLEFT // len(big_indices), TRUNCATIONLIMIT // 2)
+            MAXBIGBOXCHARS = max(CHARSLEFT // len(big_indices), 0)
         else:
             MAXBIGBOXCHARS = 0
 
+        total_stubs = len(title_stubs)
         dbg(
             f"smart-cap: total={len(combined)} kept={len(kept_entries)} "
-            f"overflow={len(overflow_entries)} small={len(small_indices)} "
+            f"stubs={total_stubs} small={len(small_indices)} "
             f"big={len(big_indices)} small_chars={SMALLBOXESCHARS} "
             f"chars_left={CHARSLEFT} max_big={MAXBIGBOXCHARS}"
         )
@@ -3760,9 +3864,13 @@ def main():
         # MAX_ENTRIES until it fits its target. Falls back to row truncation
         # if even MAX_ENTRIES=0 is too big.
         def _rebuild_main_under(target: int) -> str:
+            # NB: we intentionally do NOT include 0 in this tuple because
+            # _cap_list treats max_n <= 0 as "unlimited" — passing 0 would
+            # produce the SAME output as the initial max_entries rebuild
+            # and waste a full render pass.
             rebuilt = ""
-            for me_attempt in (max_entries, 8, 6, 4, 3, 2, 1, 0):
-                if me_attempt > max_entries:
+            for me_attempt in (max_entries, 8, 6, 4, 3, 2, 1):
+                if me_attempt > max_entries or me_attempt <= 0:
                     continue
                 rebuilt = build_report(
                     hook_event,
@@ -3794,6 +3902,7 @@ def main():
                         orch_usage_inner,
                         sub_usage_list,
                         html_report_path=html_path_display,
+                        max_entries=me_attempt,
                     )
                     rebuilt = rebuilt + "\n" + wt_extra
                 if len(rebuilt) <= target:
@@ -3818,9 +3927,10 @@ def main():
         # bottom (which the reader sees last and is most important).
         combined = "\n".join(title_stubs + rendered_kept)
 
-        # Final safety net.
+        # Final safety net — use line-safe truncation so we never cut a
+        # unicode box border or an ANSI sequence mid-escape.
         if len(combined) > TOTCHARS:
-            combined = combined[: TOTCHARS - 20] + "\n[...truncated]"
+            combined = _line_safe_truncate(combined, TOTCHARS)
         dbg(
             f"smart-cap result: {len(combined)} chars ({len(rendered_kept)} "
             f"boxes + {len(title_stubs)} stubs)"
