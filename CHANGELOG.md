@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.3] - 2026-04-15
+
+
+### Bug Fixes
+
+- ANSI-aware truncation + display-width-aware box content
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.10.2
+
 ## [1.10.2] - 2026-04-15
 
 
