@@ -1398,6 +1398,69 @@ def _rel_path(filepath: str, project_dir: str) -> str:
             return filepath
 
 
+def _col_width(c: str) -> int:
+    """Display width (terminal columns) for a single Unicode character.
+
+    Mirrors the inline `_char_width` inside `_render_box` so call sites
+    that need display-aware truncation BEFORE the box is rendered can
+    use the same logic. Handles:
+
+    - Box-drawing chars (U+2500..U+259F) as 1-wide (they are rendered
+      as 1 column by every terminal that supports unicode boxes).
+    - Combining marks (category M*) and format chars (Cf) as 0-wide.
+    - Wide/Full east-asian chars (CJK ideographs, etc.) as 2-wide.
+    - Symbols (So) as 2-wide (emoji fallback — imperfect for ZWJ
+      sequences but good enough for typical skill/agent names).
+    - Everything else as 1-wide.
+    """
+    import unicodedata
+
+    cp = ord(c)
+    if 0x2500 <= cp <= 0x259F:
+        return 1
+    cat = unicodedata.category(c)
+    if cat.startswith("M") or cat == "Cf":
+        return 0
+    ea = unicodedata.east_asian_width(c)
+    if ea in ("F", "W"):
+        return 2
+    if cat.startswith("So"):
+        return 2
+    return 1
+
+
+def _display_width(text: str) -> int:
+    """Display width in terminal columns (ANSI-stripped, east-asian-aware)."""
+    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    return sum(_col_width(c) for c in plain)
+
+
+def _display_trunc(text: str, max_cols: int, ellipsis: str = "…") -> str:
+    """Truncate `text` to at most `max_cols` display columns.
+
+    Unlike a plain `text[:n]` slice this counts display columns (CJK =
+    2, combining marks = 0, box-drawing = 1) so a wide string like a
+    CJK skill name or emoji path doesn't overflow the unicode box it
+    goes into.
+
+    When truncation happens, appends `ellipsis` (default "…", 1 col).
+    Input text is assumed to be plain (no ANSI codes). If the text
+    already fits, it is returned unchanged.
+    """
+    if _display_width(text) <= max_cols:
+        return text
+    ell_w = _col_width(ellipsis) if ellipsis else 0
+    w = 0
+    out_chars: list[str] = []
+    for c in text:
+        cw = _col_width(c)
+        if w + cw > max_cols - ell_w:
+            break
+        out_chars.append(c)
+        w += cw
+    return "".join(out_chars) + ellipsis
+
+
 def _cap_list(items: list, max_n: int) -> tuple[list, int]:
     """Cap a list to max_n entries; return (capped, hidden_count).
 
@@ -1960,7 +2023,9 @@ def build_report(
             )
             shown_skills, hidden_skills = _cap_list(skill_rows, max_entries)
             for sk_name, sk_count, sk_res, sk_out, sk_cost in shown_skills:
-                short_sk = sk_name if len(sk_name) <= 34 else sk_name[:31] + "..."
+                # Display-width truncation: CJK/emoji skill names display
+                # as 2 cols per char so code-point length would overflow.
+                short_sk = _display_trunc(sk_name, 34)
                 parts = []
                 if sk_res > 0:
                     parts.append(f"{Y}{fmt_tok(sk_res)}{R} {S}result→input{R}")
@@ -2198,10 +2263,9 @@ def build_skills_box(
 
     shown_skills, hidden_skills = _cap_list(skill_rows, max_entries)
     for sk_name, sk_count, sk_res, sk_out, sk_cost in shown_skills:
-        # Truncate the displayed name but keep the full identifier in the
-        # box header — the stripped suffix is rare and not informative for
-        # cost attribution (the prefix is the namespace that matters).
-        short_sk = sk_name if len(sk_name) <= 38 else sk_name[:35] + "..."
+        # Display-width truncation — counts east-asian-wide chars as 2
+        # columns so CJK/emoji skill names don't overflow the box.
+        short_sk = _display_trunc(sk_name, 38)
         rows.append(("", f"{S}>{R} {W}{short_sk}{R} {G}x{sk_count}{R}"))
         parts = []
         if sk_res > 0:
@@ -3028,7 +3092,7 @@ def build_worktree_report(
             )
         )
         for sk_name, sk_count, sk_cost in sk_rows_wt[:6]:
-            short_sk = sk_name if len(sk_name) <= 34 else sk_name[:31] + "..."
+            short_sk = _display_trunc(sk_name, 34)
             cost_str = f" {C}${sk_cost:.4f}{R}" if sk_cost > 0 else ""
             rows.append(("", f"  {S}L{R} {W}{short_sk}{R} {G}x{sk_count}{R}{cost_str}"))
 
@@ -3037,6 +3101,9 @@ def build_worktree_report(
         rows.append(("", f"{S}Full report:{R} {H}{html_report_path}{R}"))
 
     return _render_box(rows)
+
+
+_ANSI_RESET = "\033[0m"
 
 
 def _line_safe_truncate(s: str, target: int, suffix: str = "\n[...truncated]") -> str:
@@ -3048,23 +3115,47 @@ def _line_safe_truncate(s: str, target: int, suffix: str = "\n[...truncated]") -
     boundary we guarantee each retained line is a complete, self-contained
     unit. Every row in our boxes ends with a reset so no color state leaks.
 
-    When the budget is so small that no full line fits, falls back to a
-    hard char slice at `max(target - len(suffix), 0)`. This is worse than
-    line-safe but only triggers on degenerate inputs.
+    When there is no newline before the budget, falls back to an
+    ANSI-aware walk that cuts only at complete-escape-sequence boundaries
+    — never mid-ESC — and appends a reset (when the retained prefix
+    contains ANSI) before the suffix so terminal state is left clean.
+    The total output is guaranteed to be ≤ `target` characters.
     """
     if len(s) <= target:
         return s
+    # Reserve room for the suffix. The reset is only appended when the
+    # walked prefix actually contains ANSI, so we reserve for it
+    # conditionally below.
     budget = target - len(suffix)
     if budget <= 0:
         # Not even room for the suffix — return just the suffix
         return suffix.lstrip("\n")
     cut = s.rfind("\n", 0, budget)
-    if cut <= 0:
-        # No newline before the budget — fall back to a hard cut at the
-        # last char. Worst case: a mid-ANSI corruption, but this only
-        # triggers on strings with no newlines at all.
-        return s[:budget] + suffix
-    return s[:cut] + suffix
+    if cut > 0:
+        return s[:cut] + suffix
+    # No newline before the budget — walk the string byte-by-byte,
+    # advancing past complete ANSI SGR sequences atomically. If an SGR
+    # sequence would push us past the ANSI-adjusted budget, stop BEFORE
+    # it so we never leave a partial escape in the output.
+    ansi_re = re.compile(r"\033\[[0-9;]*m")
+    # Reserve for a possible trailing reset so the total stays ≤ target.
+    reset_reserve = len(_ANSI_RESET)
+    safe_budget = max(budget - reset_reserve, 0)
+    i = 0
+    saw_ansi = False
+    while i < len(s) and i < safe_budget:
+        m = ansi_re.match(s, i)
+        if m:
+            end = m.end()
+            if end > safe_budget:
+                break
+            i = end
+            saw_ansi = True
+        else:
+            i += 1
+    # Only append the reset if we actually retained an ANSI sequence.
+    reset = _ANSI_RESET if saw_ansi else ""
+    return s[:i] + reset + suffix
 
 
 def _truncate_box_to_chars(box: str, target_chars: int) -> str:
@@ -3104,15 +3195,32 @@ def _truncate_box_to_chars(box: str, target_chars: int) -> str:
     footer = lines[-1:]
     body = lines[header_end:-1]
 
+    # Build an indicator row whose VISIBLE width matches the box's actual
+    # inner width. Different boxes have different widths (build_report ≈ 78,
+    # build_worktree_report ≈ 90) and a hardcoded indicator would break
+    # border alignment. We measure the inner width from the top-border row
+    # (which is `╭───╮` or similar — corner + fill + corner).
+    top_border_plain = re.sub(r"\033\[[0-9;]*m", "", lines[0]) if lines else ""
+    box_total_w = _display_width(top_border_plain)
+    # Inner width = total - 2 for the two vertical borders. Fallback 76.
+    inner_w = max(box_total_w - 2, 30) if box_total_w >= 4 else 76
+
+    def _make_indicator(n: int) -> str:
+        # Blue color code + reset, with a padded-to-inner-width content so
+        # the vertical borders of the box still line up after insertion.
+        # `_display_trunc` handles overflow if inner_w is unusually narrow.
+        raw = f" ⋯ {n} rows truncated — see HTML report"
+        raw = _display_trunc(raw, inner_w)
+        visible_pad = inner_w - _display_width(raw)
+        if visible_pad > 0:
+            raw = raw + " " * visible_pad
+        return f"│\033[94m{raw}\033[0m│"
+
     # Drop body rows from the bottom until the box fits, leaving room for
-    # the truncation indicator row (~80 chars).
-    indicator_template = (
-        "│ " + "\033[94m" + " ⋯ {n} rows truncated — see HTML report" + "\033[0m" + " │"
-    )
-    # Add the indicator after dropping rows
+    # the truncation indicator row.
     dropped = 0
     while body:
-        candidate_body = body + [indicator_template.format(n=dropped + 1)]
+        candidate_body = body + [_make_indicator(dropped + 1)]
         candidate = "\n".join(header + candidate_body + footer)
         if len(candidate) <= target_chars:
             return candidate
@@ -3121,7 +3229,7 @@ def _truncate_box_to_chars(box: str, target_chars: int) -> str:
 
     # Even an empty body + indicator + header + footer is too big.
     # Last resort: just keep header + footer + indicator.
-    indicator = indicator_template.format(n=dropped) if dropped else ""
+    indicator = _make_indicator(dropped) if dropped else ""
     minimal = "\n".join(header + ([indicator] if indicator else []) + footer)
     if len(minimal) <= target_chars:
         return minimal
