@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.10.2] - 2026-04-15
+
+
+### Bug Fixes
+
+- 9 smart-cap audit findings from LLM externalizer scan
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.10.1
+
 ## [1.10.1] - 2026-04-15
 
 
