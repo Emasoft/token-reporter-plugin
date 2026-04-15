@@ -269,7 +269,7 @@ The plugin exposes three `userConfig` entries in `plugin.json`. Each one is also
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
-| `OUTPUT_LIMIT_CHARS` | number | `10000` | Max characters injected into the transcript. The v2.1.101 hooks reference states 10,000; the v2.1.90 changelog says 50,000. Default is conservative. Raise via `CLAUDE_PLUGIN_OPTION_OUTPUT_LIMIT_CHARS` if your version supports more. |
+| `OUTPUT_LIMIT_CHARS` | number | `10000` | Max characters injected into the transcript. **The Claude Code binary hardcodes a 10,000 char cap on hook output** (`additionalContext` / `systemMessage` / stdout) — output exceeding this is silently saved to disk and replaced with an opaque preview stub, destroying the inline box. Source: [official hooks docs](https://code.claude.com/docs/en/hooks). Keep at 10000 unless Anthropic raises the cap in a future Claude Code version. The plugin enforces this cap *itself* (drops oldest sub-agent reports first, then hard-truncates) so the unicode box stays renderable. |
 | `SKILLS_BOX` | boolean | `false` | When `true`, the per-skill cost breakdown is rendered in its own dedicated unicode box instead of as an inline section in the main report. Useful for sessions with many skill invocations where the inline section would crowd the main box. |
 | `MAX_ENTRIES_PER_SECTION` | number | `12` | Caps the number of entries shown per inline list section (skills, bash commands, web fetches, files, sub-agents). Lists exceeding this length show a `⋯ +N more — see HTML report` indicator. The full untruncated data is always available in the HTML report. Set to `0` to disable truncation entirely. |
 

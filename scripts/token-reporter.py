@@ -3537,11 +3537,24 @@ def main():
     all_reports = subagent_reports + [report]
     combined = "\n".join(all_reports)
 
-    # Hook output character cap. Claude Code docs disagree:
-    #   - Hooks reference (v2.1.101): "Output is capped at 10,000 characters"
-    #   - Changelog v2.1.90: "Hook output >50K characters saved to disk"
-    # We default to 10K (safest) but allow override via env var or the
-    # CLAUDE_PLUGIN_OPTION_OUTPUT_LIMIT_CHARS user config value.
+    # Hook output character cap = 10,000 characters. This is hardcoded in the
+    # Claude Code binary and is NOT user-configurable on the Claude side. The
+    # authoritative source is https://code.claude.com/docs/en/hooks under the
+    # JSON output section:
+    #
+    #   "Hook output injected into context (additionalContext, systemMessage,
+    #    or plain stdout) is capped at 10,000 characters. Output that exceeds
+    #    this limit is saved to a file and replaced with a preview and file
+    #    path, the same way large tool results are handled."
+    #
+    # If we exceed 10K, our pretty unicode box gets replaced by an opaque
+    # "[saved to file]" stub — bad UX. So we apply the same cap *ourselves*
+    # before that happens, drop oldest sub-agent reports, and direct the
+    # reader to the full HTML archive at <project>/reports/token-reporter/.
+    #
+    # The OUTPUT_LIMIT_CHARS user config exists as an escape hatch in case
+    # Anthropic raises the cap in a future Claude Code version; for now,
+    # keep it at 10000 (matches the binary's hardcoded value).
     def _resolve_output_limit() -> int:
         raw = (
             os.environ.get("TOKEN_REPORTER_OUTPUT_LIMIT_CHARS")

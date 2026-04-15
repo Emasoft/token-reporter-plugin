@@ -29,7 +29,7 @@
       "type": "number",
       "title": "Hook output character limit",
       "default": 10000,
-      "description": "Maximum character count for the report injected into the transcript. Claude Code's hooks reference states 10,000 chars; the 2.1.90 changelog says 50,000. Keep low (10000) for safety, raise to 48000 if your Claude Code version supports it."
+      "description": "Maximum character count for the report injected into the transcript. The Claude Code binary hardcodes a 10,000 char cap on hook output (additionalContext / systemMessage / stdout) — output exceeding this is silently saved to a file and replaced with a preview stub, which destroys the inline box. Source: https://code.claude.com/docs/en/hooks. Keep this at 10000 unless Anthropic raises the cap in a future Claude Code version."
     },
     "SKILLS_BOX": {
       "type": "boolean",
