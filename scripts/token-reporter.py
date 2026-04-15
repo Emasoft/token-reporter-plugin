@@ -912,8 +912,20 @@ def parse_agent_transcript(
         "compact_events": [],  # v2.1.90+ compact_boundary markers
         "spilled_tool_bytes": 0,  # v2.1.90 tool-results/ spillover files
         "skill_preprocessing_tokens": 0,  # v2.1.91+ !`...` inline shell
+        "entries_with_usage": 0,  # total JSONL rows that carried a usage block
     }
     seen = set()
+    # Stream-chunk tracking: Claude Code writes one JSONL entry per streaming
+    # delta. Entries with the same message id share input/cw/cr (frozen after
+    # the first chunk) but have growing output_tokens. The `seen` set guards
+    # against double-counting input/cw/cr. `mid_output_seen` lets us keep the
+    # FINAL (highest) output_tokens value from the last streaming chunk,
+    # instead of the stub value from the first chunk. Without this fix,
+    # output tokens are under-counted by ~20-25% (verified empirically on
+    # 2026-04-15 against the llm-externalizer session: first-wins gave
+    # 1,169,734 output, last-wins gave 1,456,634 — a $7.17 gap at Opus).
+    mid_output_seen: dict[str, int] = {}
+    entries_with_usage = 0  # total JSONL rows that carried a usage block
     # State for cache invalidation detection
     _prev_ts = ""  # timestamp of previous assistant message
     _prev_cr = 0  # previous cache_read
@@ -1074,10 +1086,12 @@ def parse_agent_transcript(
 
         msg = entry["message"]
         mid = msg.get("id", "")
+        u = msg.get("usage", {}) if isinstance(msg, dict) else {}
+        if u:
+            entries_with_usage += 1
 
         if mid and mid not in seen:
             seen.add(mid)
-            u = msg.get("usage", {})
             if u:
                 model = msg.get("model", "unknown")
                 for f in [
@@ -1093,6 +1107,9 @@ def parse_agent_transcript(
                     r["models_used"][model][f] += v
                 r["message_count"] += 1
                 r["models_used"][model]["message_count"] += 1
+                # Record the first-chunk output value so subsequent streaming
+                # chunks can grow it to its final value.
+                mid_output_seen[mid] = _get_usage_field(u, "output_tokens")
 
                 # ── Cache invalidation detection ──
                 # A spike in cache_creation with a drop in cache_read signals
@@ -1168,6 +1185,20 @@ def parse_agent_transcript(
                 _prev_ts = ts
                 _prev_cr = cr
                 _recent_writes = []  # reset after processing
+        elif mid and u:
+            # Subsequent streaming chunk for an already-seen mid.
+            # input/cw/cr are frozen after the first chunk, but output_tokens
+            # grows until the final chunk. Upgrade r["output_tokens"] to the
+            # new value whenever the streaming delta grows.
+            new_out = _get_usage_field(u, "output_tokens")
+            prev_out = mid_output_seen.get(mid, 0)
+            if new_out > prev_out:
+                delta = new_out - prev_out
+                r["output_tokens"] += delta
+                model = msg.get("model", "unknown")
+                if model in r["models_used"]:
+                    r["models_used"][model]["output_tokens"] += delta
+                mid_output_seen[mid] = new_out
 
         content = msg.get("content", [])
         if not isinstance(content, list):
@@ -1220,6 +1251,7 @@ def parse_agent_transcript(
     r["files_read"] = sorted(r["files_read"])
     r["files_written"] = sorted(r["files_written"])
     r["files_edited"] = sorted(r["files_edited"])
+    r["entries_with_usage"] = entries_with_usage
 
     # v2.1.90 tool-results/ spillover: credit any spilled files to the tool
     # that produced them. Filename stem is typically the tool_use_id.
@@ -1268,8 +1300,20 @@ def build_report(
     identity: dict,
     sub_usage_list: list[Any] | None = None,
     session_events: list | None = None,
+    subagent_fallback: bool = False,
+    events_log_path: str = "",
 ) -> str:
-    """Build a compact unicode-bordered report for terminal display."""
+    """Build a compact unicode-bordered report for terminal display.
+
+    Args:
+        subagent_fallback: True when a SubagentStop event hit the fallback
+            path of parsing the main session transcript instead of the
+            subagent's own transcript. The reported totals then reflect
+            the entire session, not just the subagent.
+        events_log_path: Optional filesystem path where all cache events
+            were persisted, so users can inspect events beyond the top-5
+            shown inline.
+    """
     is_sub = hook_event in ("SubagentStop", "TeammateIdle", "TaskCompleted")
     # Show the hook event type as the label for teammate/task events
     label_map = {
@@ -1356,31 +1400,93 @@ def build_report(
     sub_type = identity.get("subagent_type", "") if is_sub else ""
     type_part = f" {W}{sub_type}{R}" if sub_type else ""
     label_color = "\033[91m" if hook_event == "StopFailure" else S
+    # Streaming overhead indicator: Claude Code writes 1 JSONL entry per
+    # streaming delta. When entries >> messages, the transcript is split
+    # across many chunks per message (normal for long outputs).
+    entries = usage.get("entries_with_usage", 0)
+    entries_hint = ""
+    if entries and entries > msgs:
+        entries_hint = f" {S}({entries} entries){R}"
     header_line = (
         f"{label_color}{label}{R}{type_part}"
         f" {H}{short_id}{R}"
         f" {S}|{R} {W}{model_names}{R}"
         f" {S}|{R} {W}{msgs}{R}"
-        f" {S}messages{R}{duration_str}"
+        f" {S}messages{R}{entries_hint}{duration_str}"
     )
     rows.append(header_line)
 
-    # Primary tokens (bright yellow values, static labels)
-    primary_input = inp + cw
+    # Subagent-fallback warning: SubagentStop fired but the subagent's own
+    # transcript was not available, so we parsed the whole main session. The
+    # numbers then reflect the ENTIRE session, not just this subagent.
+    if subagent_fallback:
+        RED = "\033[91m"
+        rows.append(
+            (
+                "",
+                f"  {RED}⚠ SUBAGENT TRANSCRIPT MISSING — numbers below "
+                f"reflect the ENTIRE main session, not just this subagent{R}",
+            )
+        )
+
+    # Implausible-size warning: even without fallback, a "subagent" with
+    # thousands of messages or hundreds of hours is suspicious and might
+    # actually be a long-running background agent OR the fallback case.
+    if is_sub and not subagent_fallback:
+        dur_hours = 0.0
+        t0 = usage.get("first_timestamp", "")
+        t1 = usage.get("last_timestamp", "")
+        if t0 and t1:
+            from datetime import datetime as _dt
+
+            try:
+                dt0 = _dt.fromisoformat(t0.replace("Z", "+00:00"))
+                dt1 = _dt.fromisoformat(t1.replace("Z", "+00:00"))
+                dur_hours = (dt1 - dt0).total_seconds() / 3600
+            except (ValueError, TypeError):
+                pass
+        if msgs > 5000 or dur_hours > 24:
+            RED = "\033[91m"
+            rows.append(
+                (
+                    "",
+                    f"  {RED}⚠ UNUSUALLY LARGE SUBAGENT"
+                    f" ({msgs} messages, {dur_hours:.0f}h)"
+                    f" — verify the numbers match your Anthropic dashboard{R}",
+                )
+            )
+
+    # Primary tokens — show each Anthropic billing category separately so
+    # users don't confuse cache_write with user-typed input. Headline covers
+    # new input, cache_write (rebuild cost), and output. Cache_read is on the
+    # next line because it's excluded from rate limits.
     tok_val = (
-        f"{Y}{fmt_tok(primary_input)}{R}"
-        f" {S}input{R} {S}/{R}"
-        f" {Y}{fmt_tok(out)}{R} {S}output{R}"
+        f"{Y}{fmt_tok(inp)}{R} {S}new in{R} {S}/{R}"
+        f" {Y}{fmt_tok(cw)}{R} {S}cached{R} {S}/{R}"
+        f" {Y}{fmt_tok(out)}{R} {S}out{R}"
     )
     rows.append(("Tokens", tok_val))
 
-    # Cache write — counted toward rate limits
+    # Explain the three billed-input categories for users who see millions
+    # of "cached" tokens and wonder where they came from.
     if cw > 0:
-        rows.append(("", f"{S}  L cache-write (included):{R} {Y}{fmt_tok(cw)}{R}"))
+        rows.append(
+            (
+                "",
+                f"{S}  L cached (billed 1.25x, included in limits):{R}"
+                f" {Y}{fmt_tok(cw)}{R}",
+            )
+        )
 
-    # Cache read — NOT counted toward rate limits
+    # Cache read — NOT counted toward rate limits, billed 0.1x
     if cr > 0:
-        rows.append(("", f"{S}  L cache-read (excluded):{R} {Y}{fmt_tok(cr)}{R}"))
+        rows.append(
+            (
+                "",
+                f"{S}  L cache-read (billed 0.1x, excluded from limits):{R}"
+                f" {Y}{fmt_tok(cr)}{R}",
+            )
+        )
 
     # Cache efficiency — how much of total input came from cache
     total_input_all = inp + cw + cr
@@ -1443,6 +1549,23 @@ def build_report(
                     f" {fmt_tok(cw_tok)} resent{R}"
                     f" {S}— {cause}"
                     f"{idle_str}{tools_str}{R}",
+                )
+            )
+        # Show N total when capped — users need to know they're looking
+        # at a truncated slice of the full event list.
+        if len(cache_events) > 5:
+            rows.append(
+                (
+                    "",
+                    f"  {S}  (showing top 5 of {len(cache_events)} events — "
+                    f"see log for the rest){R}",
+                )
+            )
+        if events_log_path:
+            rows.append(
+                (
+                    "",
+                    f"  {S}  full event log: {events_log_path}{R}",
                 )
             )
         # Batching opportunity: count invalidations
@@ -2293,6 +2416,11 @@ def main():
     usage = {}  # type: dict
     max_retries = 6 if is_stop_event else 1
     retry_delay = 1.0  # seconds between retries for Stop events
+    # Track whether we hit the SubagentStop fallback path (subagent transcript
+    # missing — we end up parsing the whole main session which will look
+    # absurdly large for a single "subagent"). Reported in the box so users
+    # don't misread a session-sized bill as one subagent's cost.
+    subagent_fallback = False
 
     for attempt in range(max_retries):
         if attempt > 0:
@@ -2317,6 +2445,11 @@ def main():
             usage = parse_agent_transcript(
                 transcript_path, session_id=session_id, last_op_only=is_stop
             )
+            # For subagent-style events, falling back to the main transcript
+            # means we're about to report the ENTIRE main session as if it
+            # were one subagent. Flag it so build_report can warn the user.
+            if is_subagent_event:
+                subagent_fallback = True
         else:
             dbg("exit: no transcript path found")
             sys.exit(0)
@@ -2371,6 +2504,29 @@ def main():
     session_events = _read_session_events(session_id)
     dbg(f"read {len(session_events)} session events")
 
+    # Step 3b: Persist the full cache-events list to disk. The report box
+    # can only fit top-5 by resent size, but users debugging cost leaks
+    # need ALL N events with timestamps and causes. Writes to:
+    #   ${CLAUDE_PLUGIN_DATA}/cache-events/<session_short>-<timestamp>.jsonl
+    # One JSONL line per event, safe to diff / grep / analyse offline.
+    cache_events = usage.get("cache_events", [])
+    events_log_path = None
+    if cache_events:
+        try:
+            events_dir = _plugin_data_dir() / "cache-events"
+            events_dir.mkdir(parents=True, exist_ok=True)
+            sid_label = session_id[:16] or (agent_id[:16] or "unknown")
+            events_log_path = (
+                events_dir / f"{sid_label}-{int(time.time())}-{hook_event}.jsonl"
+            )
+            with events_log_path.open("w", encoding="utf-8") as f:
+                for ev in cache_events:
+                    f.write(json.dumps(ev, default=str) + "\n")
+            dbg(f"persisted {len(cache_events)} cache events to {events_log_path}")
+        except OSError as e:
+            dbg(f"failed to persist cache events: {e}")
+            events_log_path = None
+
     # Step 4: Build report (pass sub_usage_list for summary in main box)
     report = build_report(
         hook_event,
@@ -2379,6 +2535,8 @@ def main():
         identity,
         sub_usage_list,
         session_events=session_events,
+        subagent_fallback=subagent_fallback,
+        events_log_path=str(events_log_path) if events_log_path else "",
     )
     dbg(f"report built, length={len(report)}")
 
