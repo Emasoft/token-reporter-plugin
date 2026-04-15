@@ -55,7 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
+            "command": "uv run --with tiktoken python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
           }
         ]
       }
@@ -65,7 +65,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
+            "command": "uv run --with tiktoken python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
           }
         ]
       }
@@ -75,7 +75,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
+            "command": "uv run --with tiktoken python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
           }
         ]
       }
@@ -85,7 +85,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
+            "command": "uv run --with tiktoken python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-reporter.py"
           }
         ]
       }

@@ -32,8 +32,28 @@ jobs:
         env:
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          # Read the actual plugin name from plugin.json (may differ from repo name)
-          PLUGIN_NAME=$(python3 -c "import json; print(json.load(open('.claude-plugin/plugin.json'))['name'])")
+          # Read the actual plugin name from plugin.json (may differ from repo name).
+          # Explicit utf-8 encoding + context manager + clean error if the manifest
+          # is missing or malformed (otherwise the workflow fails with a raw
+          # traceback that's hard to diagnose in the Actions UI).
+          if [ ! -f .claude-plugin/plugin.json ]; then
+            echo "::error::.claude-plugin/plugin.json not found in checkout"
+            exit 1
+          fi
+          PLUGIN_NAME=$(python3 - <<'PY'
+          import json, sys
+          try:
+              with open('.claude-plugin/plugin.json', encoding='utf-8') as f:
+                  data = json.load(f)
+              name = data['name']
+              if not name:
+                  raise ValueError('plugin.json: name field is empty')
+              print(name)
+          except (json.JSONDecodeError, KeyError, ValueError, OSError) as e:
+              print(f'::error::failed to read plugin.json: {e}', file=sys.stderr)
+              sys.exit(1)
+          PY
+          )
           echo "name=${PLUGIN_NAME}" >> "$GITHUB_OUTPUT"
           echo "ref=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
 

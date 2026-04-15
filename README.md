@@ -270,8 +270,6 @@ The plugin exposes a single `userConfig` entry in `plugin.json`:
 
 You can also set the cap via the plain env var `TOKEN_REPORTER_OUTPUT_LIMIT_CHARS` if `userConfig` is not available (local dev, older Claude Code).
 
-**Debug gate**: The hook first walks the process tree (`getppid()` → `ps -o args=`) checking for a parent `claude` process with `--debug` flag. If not found, the hook exits immediately with no output or processing.
-
 **Why the temp file pattern?** Claude Code only renders `systemMessage` output to the terminal for Stop events. SubagentStop/TeammateIdle/TaskCompleted output is consumed as system context but not displayed. So the script saves child agent reports to temp files, and the Stop hook collects and displays them all together.
 
 **Why the retry loop?** The Stop hook fires before the current response is fully written to the JSONL transcript file. The script retries up to 6 times with exponential backoff (1s → 5s) until assistant messages appear.
