@@ -172,7 +172,9 @@ def _read_session_events(session_id: str) -> list:
         return []
     out = []
     try:
-        with path.open("r", encoding="utf-8") as f:
+        # errors="replace" — mirror parse_jsonl; an invalid-UTF-8 event line
+        # should not crash the reporter.
+        with path.open("r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -412,9 +414,13 @@ def get_pricing(model_name: str) -> dict:
         return DEFAULT_PRICING
     if model_name in MODEL_PRICING:
         return MODEL_PRICING[model_name]
-    for key, pricing in MODEL_PRICING.items():
+    # Iterate keys sorted by LENGTH descending so the longest (most specific)
+    # prefix wins. Otherwise "claude-sonnet-4" could match before
+    # "claude-sonnet-4-5" for a model name like "claude-sonnet-4-5-beta"
+    # since Python dict iteration order is insertion order.
+    for key in sorted(MODEL_PRICING.keys(), key=len, reverse=True):
         if key in model_name or model_name.startswith(key):
-            return pricing
+            return MODEL_PRICING[key]
     ml = model_name.lower()
     if "opus" in ml and ("4-6" in ml or "4.6" in ml):
         return MODEL_PRICING["claude-opus-4-6"]
@@ -634,7 +640,10 @@ def _merge_usage(base: dict, add: dict):
 
 def parse_jsonl(filepath: str):
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        # errors="replace" — invalid UTF-8 in transcripts (e.g. bash output
+        # from `find`, binary spill, corrupted chunks) would otherwise raise
+        # UnicodeDecodeError and crash the hook mid-parse.
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -1342,12 +1351,17 @@ def parse_agent_transcript(
         total_spill = 0
         for key, size in spill_files.items():
             total_spill += size
-            # Try exact match first, then longest-prefix match
+            # Try exact match first, then extension-boundary match.
+            # Previous implementation used `key.startswith(tuid) or
+            # tuid.startswith(key)` which double-credits when two tool ids
+            # share a common prefix (e.g. "toolu_01" and "toolu_012"). The
+            # boundary must be an extension separator '.' so only
+            # "toolu_01.txt" matches tool "toolu_01", never "toolu_012".
             tool_name = tool_use_id_map.get(key, "")
             matched_key = key if tool_name else ""
             if not tool_name:
                 for tuid, tn in tool_use_id_map.items():
-                    if key.startswith(tuid) or tuid.startswith(key):
+                    if key == tuid or key.startswith(tuid + "."):
                         tool_name = tn
                         matched_key = tuid
                         break
@@ -1430,7 +1444,10 @@ def build_report(
 
     models_used = usage.get("models_used", {})
     real_models = {m: s for m, s in models_used.items() if m != "<synthetic>"}
-    total_cost = sum(estimate_cost(s, m) for m, s in models_used.items())
+    # Exclude "<synthetic>" placeholder usage from cost: estimate_cost on a
+    # synthetic model falls back to DEFAULT_PRICING and inflates the total
+    # with a fake cost that never hit the real API.
+    total_cost = sum(estimate_cost(s, m) for m, s in real_models.items())
     model_names = "/".join(shorten_model(m) for m in real_models.keys()) or "unknown"
 
     # Token breakdown
@@ -2791,8 +2808,12 @@ def main():
         report = report + "\n" + wt_report
         dbg(f"worktree report appended, total length={len(report)}")
 
-    # Temp dir for saving subagent reports (collected by Stop hook)
-    report_dir = Path(tempfile.gettempdir()) / "token-reporter" / session_id[:16]
+    # Temp dir for saving subagent reports (collected by Stop hook).
+    # session_id comes from hook_input and is untrusted: sanitize before
+    # using it as a path component so values like "../../etc" or "a/b"
+    # cannot escape the temp dir.
+    safe_session_id = re.sub(r"[^A-Za-z0-9_-]", "_", session_id[:16])
+    report_dir = Path(tempfile.gettempdir()) / "token-reporter" / safe_session_id
 
     if is_subagent_event:
         # Save this subagent/teammate/task report to a temp file for later collection
