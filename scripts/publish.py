@@ -25,7 +25,7 @@ MANDATORY QUALITY GATES (all unskippable, all must return 0 errors):
     1.  Pre-push hook:        .git/hooks/pre-push exists and is executable
     2.  Clean working tree:   no uncommitted or staged changes
     3.  Lint (all .py files): ruff check + ruff format --check
-    4.  Type check:           mypy on token-reporter.py (0 errors)
+    4.  Type check:           mypy on all .py files in scripts/ (0 errors)
     5.  Syntax check:         py_compile all .py files in scripts/
     6.  Test suite:           every test in tests_dev/ passes (0 failures)
     7.  CPV validation:       remote cpv-validate, summary must be all 0s
@@ -49,6 +49,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import NoReturn
 
@@ -86,9 +87,20 @@ def run_strict(
 
     Used for commands that MUST succeed. No caller can accidentally ignore
     the return code because we call die() on failure here.
+
+    NOTE: encoding="utf-8" is forced (with errors="replace") so subprocess
+    output decoding never crashes on non-UTF-8 systems where the default
+    locale would otherwise be used.
     """
     print(f"  $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     if result.returncode != 0:
         if result.stdout:
             print(result.stdout)
@@ -102,8 +114,17 @@ def run_probe(cmd: list[str]) -> subprocess.CompletedProcess:
     """Run a command for its return code; capture output but do not abort.
 
     Only used where the return code is explicitly inspected by the caller.
+
+    NOTE: encoding="utf-8" is forced (with errors="replace") so subprocess
+    output decoding never crashes on non-UTF-8 systems.
     """
-    return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 # ─────────────────────────────────────────────
@@ -134,7 +155,10 @@ def extract_release_notes(changelog_path: Path, version: str) -> str:
         die(f"CHANGELOG.md not found at {changelog_path}")
     content = changelog_path.read_text(encoding="utf-8")
     # Match: ## [1.3.2] - 2026-04-11\n ... (until next ## [ or EOF)
-    pattern = rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)"
+    # The trailing \n? (not \n) handles the edge case where the version
+    # header is the LAST line of the file with no trailing newline — a
+    # required-newline pattern would silently fail to match.
+    pattern = rf"^## \[{re.escape(version)}\][^\n]*\n?(.*?)(?=^## \[|\Z)"
     m = re.search(pattern, content, re.MULTILINE | re.DOTALL)
     if m is None:
         die(
@@ -189,7 +213,10 @@ def compute_next_version(current: str, args: argparse.Namespace) -> str:
         )
     # git-cliff returns tags with the 'v' prefix (matching tag_pattern).
     # Strip it to get the bare semver for plugin.json / pyproject.toml.
-    return bumped.lstrip("v")
+    # Use removeprefix (not lstrip) — lstrip("v") would eat ALL leading 'v'
+    # characters, so a hypothetical "vv1.0.0" would become "1.0.0" and a
+    # version starting with "v" (like a future "vega" suffix) would corrupt.
+    return bumped.removeprefix("v")
 
 
 # ─────────────────────────────────────────────
@@ -300,9 +327,11 @@ def gate_lint(scripts_dir: Path) -> None:
 
 def gate_type_check(scripts_dir: Path) -> None:
     step("4", "Type check (mypy)")
-    target = scripts_dir / "token-reporter.py"
-    if not target.exists():
-        die(f"{target} not found")
+    py_files = _python_files(scripts_dir)
+    if not py_files:
+        die(f"no Python files found in {scripts_dir}")
+    paths = [str(p) for p in py_files]
+    print(f"  checking {len(py_files)} files: {', '.join(p.name for p in py_files)}")
     r = run_probe(
         [
             "uvx",
@@ -310,14 +339,14 @@ def gate_type_check(scripts_dir: Path) -> None:
             "tiktoken",
             "mypy",
             "--ignore-missing-imports",
-            str(target),
+            *paths,
         ]
     )
     if r.returncode != 0:
         print(r.stdout)
         print(r.stderr, file=sys.stderr)
         die("mypy reported type errors", hint="fix all type errors before publishing")
-    ok("mypy: 0 errors")
+    ok(f"mypy: 0 errors across {len(py_files)} files")
 
 
 # ─────────────────────────────────────────────
@@ -495,7 +524,11 @@ def gate_cpv(repo_root: Path, *, label: str = "CPV validation") -> None:
 def read_plugin_version(plugin_json: Path) -> str:
     if not plugin_json.exists():
         die(f"{plugin_json} not found — is this a claude-plugin repo?")
-    return json.loads(plugin_json.read_text(encoding="utf-8")).get("version", "0.0.0")
+    try:
+        manifest = json.loads(plugin_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"plugin.json is not valid JSON: {e}")
+    return manifest.get("version", "0.0.0")
 
 
 def write_plugin_version(plugin_json: Path, new_version: str) -> None:
@@ -528,7 +561,11 @@ def write_pyproject_version(pyproject: Path, new_version: str) -> None:
 
 def verify_versions_match(plugin_json: Path, pyproject: Path, expected: str) -> None:
     """Verify plugin.json and pyproject.toml both contain the expected version."""
-    pj_version = json.loads(plugin_json.read_text(encoding="utf-8")).get("version")
+    try:
+        pj_manifest = json.loads(plugin_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        die(f"plugin.json is not valid JSON: {e}")
+    pj_version = pj_manifest.get("version")
     if pj_version != expected:
         die(f"plugin.json version {pj_version!r} != expected {expected!r}")
     py_content = pyproject.read_text(encoding="utf-8")
@@ -692,16 +729,42 @@ def main() -> None:
     ok(f"commit and tag {tag} pushed to origin")
 
     # ── STEP 14: GitHub release ──
+    # Pass changelog notes via --notes-file (temp file) instead of --notes <text>.
+    # Long changelogs can otherwise exceed OS argv length limits (ARG_MAX on
+    # Linux ~128 KB, macOS ~256 KB) and crash gh with E2BIG.
     step("14", "GitHub release")
     notes = extract_release_notes(changelog, new_version)
-    run_strict(
-        ["gh", "release", "create", tag, "--title", tag, "--notes", notes],
+    notes_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".md",
+        delete=False,
+        encoding="utf-8",
     )
-    # Verify the release exists
-    gh_view = run_probe(["gh", "release", "view", tag])
-    if gh_view.returncode != 0:
-        die(f"GitHub release {tag} was not created")
-    ok(f"GitHub release {tag} created and verified")
+    try:
+        notes_file.write(notes)
+        notes_file.close()
+        run_strict(
+            [
+                "gh",
+                "release",
+                "create",
+                tag,
+                "--title",
+                tag,
+                "--notes-file",
+                notes_file.name,
+            ],
+        )
+        # Verify the release exists
+        gh_view = run_probe(["gh", "release", "view", tag])
+        if gh_view.returncode != 0:
+            die(f"GitHub release {tag} was not created")
+        ok(f"GitHub release {tag} created and verified")
+    finally:
+        try:
+            os.unlink(notes_file.name)
+        except OSError:
+            pass
 
     print(f"\n\033[92m✓ Published {tag}\033[0m")
 
