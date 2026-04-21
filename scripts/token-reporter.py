@@ -2688,6 +2688,36 @@ def _format_html_report(
     return "\n".join(parts)
 
 
+def _resolve_main_repo_root(cwd: str) -> str:
+    """Resolve the primary-worktree path, falling back to cwd.
+
+    Per the agent-reports-location rule, every report must land under the
+    MAIN repo checkout's reports/ folder — never inside a linked worktree.
+    `git worktree list` lists the primary checkout first, regardless of
+    which worktree we're called from, so we parse its first `worktree ...`
+    line. If git is unavailable or this isn't a git repo, fall back to cwd.
+    """
+    if not cwd:
+        return cwd
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode == 0 and result.stdout:
+            for line in result.stdout.splitlines():
+                if line.startswith("worktree "):
+                    return line[len("worktree ") :].strip()
+    except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
+        pass
+    return cwd
+
+
 def _write_html_report(
     html_content: str,
     session_id: str,
@@ -2696,14 +2726,21 @@ def _write_html_report(
 ) -> str:
     """Write the HTML report inside the project folder and return the path.
 
-    Storage layout (per the convention shared across the user's plugins):
-      <cwd>/reports/token-reporter/<timestamp>-<event>-<session>.html
+    Storage layout (per the agent-reports-location rule shared across all
+    of the user's plugins):
+      <main-repo-root>/reports/token-reporter/<YYYYMMDD_HHMMSS±HHMM>-<event>-<session>.html
+
+    `<main-repo-root>` is the primary git worktree resolved from the hook's
+    cwd — even when the hook fires inside a linked worktree, the report
+    still lands in the main checkout, so no artefact is lost when the
+    linked worktree branch is pruned. The timestamp is local time with the
+    GMT offset appended (`%z`, compact `±HHMM` form) so `ls -t` and plain
+    glob sorting order reports correctly across timezones.
 
     The hook only runs in debug mode, so the project gets a complete debug
     archive of every box that was rendered for inspection / diffing later.
-    The reports/ subdirectory is created if missing — the user is expected
-    to add `reports/` (or `reports/token-reporter/`) to their .gitignore so
-    the archive doesn't pollute commits.
+    Both `reports/` and `reports_dev/` are expected to be in the project's
+    `.gitignore` (see the agent-reports-location rule).
 
     On any I/O failure (no cwd, read-only filesystem, etc.) the function
     returns an empty string so the caller can fall back to no-link mode
@@ -2712,17 +2749,18 @@ def _write_html_report(
     if not cwd:
         dbg("no cwd in hook input — skipping HTML report")
         return ""
+    main_root = _resolve_main_repo_root(cwd)
     try:
-        out_dir = Path(cwd) / "reports" / "token-reporter"
+        out_dir = Path(main_root) / "reports" / "token-reporter"
         out_dir.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S")
+        ts = time.strftime("%Y%m%d_%H%M%S%z")
         safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", session_id[:12]) or "nosession"
         safe_event = re.sub(r"[^A-Za-z0-9_-]", "_", hook_event) or "event"
         out_path = out_dir / f"{ts}-{safe_event}-{safe_sid}.html"
         out_path.write_text(html_content, encoding="utf-8")
         return str(out_path)
     except OSError as e:
-        dbg(f"failed to write HTML report to {cwd}/reports/token-reporter: {e}")
+        dbg(f"failed to write HTML report to {main_root}/reports/token-reporter: {e}")
         return ""
 
 

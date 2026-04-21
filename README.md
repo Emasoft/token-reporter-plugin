@@ -29,7 +29,7 @@ After each Claude Code response (in debug mode), a compact unicode-bordered repo
 - **Sub-agent aggregation by type** — when the same agent type is spawned multiple times (e.g. `Explore x5`), an aggregated row shows the total count, tokens, and cost per type in addition to the individual per-instance drill-down
 - **Standalone Skills box** *(opt-in via `SKILLS_BOX`)* — when enabled, the per-skill breakdown is rendered in its own dedicated unicode box instead of as an inline section in the main report
 - **Per-section truncation** *(`MAX_ENTRIES_PER_SECTION`, default 12)* — long lists (skills, bash, web, files, sub-agents) are capped to keep inline output under Claude Code's hook output limit, with a `⋯ +N more — see HTML report` indicator
-- **Full HTML report (always on in debug mode)** — every Stop/SubagentStop event writes a self-contained nicely-formatted HTML file to `<project>/reports/token-reporter/<timestamp>-<event>-<session>.html` containing **every** section without truncation. The inline output ends with a `Full report: <path>` footer line so you can open the complete record in a browser. Add `reports/` (or `reports/token-reporter/`) to your project's `.gitignore` so the debug archive doesn't end up in commits.
+- **Full HTML report (always on in debug mode)** — every Stop/SubagentStop event writes a self-contained nicely-formatted HTML file to `<main-repo-root>/reports/token-reporter/<YYYYMMDD_HHMMSS±HHMM>-<event>-<session>.html` containing **every** section without truncation. The path resolves via `git worktree list` so linked worktrees still write to the main checkout's `reports/` folder. The inline output ends with a `Full report: <path>` footer line so you can open the complete record in a browser. Add both `reports/` and `reports_dev/` to your project's `.gitignore` per the agent-reports-location rule — reports often contain private data (session IDs, file paths, tool outputs) that must never be committed.
 - **Cost estimate** — based on published Anthropic API pricing, scoped to lifetime (agents) or current operation (session)
 - **Agent identity** — agent type/name (via v2.1.101 `agent_id`/`agent_type` hook input fields), model, message count, duration
 - **Bash commands** — every shell command executed (full list in HTML, capped inline)
@@ -280,12 +280,16 @@ Env var overrides (dev/local): `TOKEN_REPORTER_OUTPUT_LIMIT_CHARS`, `TOKEN_REPOR
 When the hook fires (which it only does in `claude --debug` mode), it always writes a full HTML report containing **every** section without truncation to:
 
 ```
-<project-cwd>/reports/token-reporter/<timestamp>-<event>-<session>.html
+<main-repo-root>/reports/token-reporter/<YYYYMMDD_HHMMSS±HHMM>-<event>-<session>.html
 ```
+
+`<main-repo-root>` is resolved via `git worktree list` — when the hook fires inside a linked worktree, the report still lands in the main checkout's `reports/` folder so nothing is lost when a worktree branch is pruned. When the hook's cwd isn't a git repo, the plugin falls back to writing under that cwd.
+
+The timestamp embeds the GMT offset (`%z`, compact `±HHMM` form — e.g. `20260421_183012+0200`) so plain glob/`ls -t` ordering works across timezones.
 
 The path is appended to the inline output as a `Full report: <path>` footer line. The HTML uses an inline dark-theme CSS, summary cards, and per-section tables — open it in any browser, no external assets required.
 
-**Add `reports/` (or `reports/token-reporter/`) to your project's `.gitignore`** so this debug archive doesn't end up in commits. The convention is shared across all of this author's plugins: every plugin saves its reports under `<project>/reports/<plugin-name>/`.
+**Add both `/reports/` and `/reports_dev/` to your project's `.gitignore`** per the agent-reports-location rule — reports often contain private data (session IDs, file paths, tool outputs) that must never be committed. The convention is shared across all of this author's plugins: every plugin saves its reports under `<main-repo-root>/reports/<plugin-name>/`.
 
 **Why the temp file pattern?** Claude Code only renders `systemMessage` output to the terminal for Stop events. SubagentStop/TeammateIdle/TaskCompleted output is consumed as system context but not displayed. So the script saves child agent reports to temp files, and the Stop hook collects and displays them all together.
 

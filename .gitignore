@@ -58,5 +58,6 @@ llm_externalizer_output/
 # Stale rechecker merge-pending files
 rck-*.md
 
-# Reports dev
+# Reports (agent-reports-location rule: both gitignored)
+reports/
 reports_dev/
