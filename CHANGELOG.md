@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.11.0] - 2026-04-21
+
+
+### Features
+
+- Canonical $MAIN_ROOT/reports/token-reporter/<ts±tz>-slug.html
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.10.3
+
 ## [1.10.3] - 2026-04-15
 
 
