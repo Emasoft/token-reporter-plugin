@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.11.1] - 2026-04-21
+
+
+### Bug Fixes
+
+- Use "python" inside uv run to pick up tiktoken from --with env
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.11.0
+
 ## [1.11.0] - 2026-04-21
 
 
