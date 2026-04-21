@@ -88,7 +88,7 @@ def main() -> int:
         "run",
         "--with",
         "tiktoken",
-        sys.executable,
+        "python",
         str(script),
         *user_args,
     ]
