@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.11.2] - 2026-04-22
+
+
+### Bug Fixes
+
+- Smart-cap retries actually run when MAX_ENTRIES_PER_SECTION=0
+
+
+### Miscellaneous
+
+- Sync uv.lock to 1.11.1
+
 ## [1.11.1] - 2026-04-21
 
 

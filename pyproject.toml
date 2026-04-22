@@ -1,6 +1,6 @@
 [project]
 name = "token-reporter"
-version = "1.11.1"
+version = "1.11.2"
 description = "Per-operation token usage reporter for Claude Code"
 requires-python = ">=3.10"
 license = "MIT"
