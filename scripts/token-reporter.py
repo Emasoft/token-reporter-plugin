@@ -4010,13 +4010,19 @@ def main():
         # MAX_ENTRIES until it fits its target. Falls back to row truncation
         # if even MAX_ENTRIES=0 is too big.
         def _rebuild_main_under(target: int) -> str:
-            # NB: we intentionally do NOT include 0 in this tuple because
-            # _cap_list treats max_n <= 0 as "unlimited" — passing 0 would
-            # produce the SAME output as the initial max_entries rebuild
-            # and waste a full render pass.
+            # Skip 0 because _cap_list treats max_n <= 0 as "unlimited" —
+            # passing 0 would reproduce the initial render that already
+            # failed the target. The `me_attempt > max_entries` check only
+            # applies when the user set a positive cap: we never want to
+            # RELAX the user's cap. When max_entries == 0 (unlimited),
+            # every positive attempt is TIGHTENING the "no cap" to a
+            # finite cap, so they all run — otherwise the loop would skip
+            # every entry and return an empty string.
             rebuilt = ""
             for me_attempt in (max_entries, 8, 6, 4, 3, 2, 1):
-                if me_attempt > max_entries or me_attempt <= 0:
+                if me_attempt <= 0:
+                    continue
+                if max_entries > 0 and me_attempt > max_entries:
                     continue
                 rebuilt = build_report(
                     hook_event,
